@@ -55,6 +55,11 @@ def dpo_step(
     beta: float,
     lr: float,
 ) -> float:
+    """
+    Perform one DPO optimization step on the policy weights.
+    For each pair, we compute the policy's preference margin (chosen score - rejected score) and the reference's preference margin, 
+    then compute the DPO loss which encourages the policy margin to be higher than the reference margin by a factor of beta.
+    """
     grads = [0.0 for _ in policy_w]
     total_loss = 0.0
 
@@ -95,8 +100,8 @@ def main() -> None:
     pairs = build_pairs() # build toy preference pairs with 3 features: factuality, format quality, unsafe tendency (higher is worse).  
 
     # 3 toy features: factuality, format_quality, unsafe_tendency (higher is worse).
-    policy_w = [0.2, 0.2, -0.1]
-    ref_w = [0.2, 0.2, -0.1]
+    policy_w = [0.2, 0.2, -0.1] # initial policy weights that slightly favor factuality and format, and slightly penalize unsafe tendency
+    ref_w = [0.2, 0.2, -0.1] # reference policy starts the same as initial policy, DPO will update policy_w to improve preference accuracy while keeping it close to ref_w
 
     beta = 0.5
     lr = 0.8

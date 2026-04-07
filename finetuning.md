@@ -1869,6 +1869,7 @@ Beginner one-liner:
 Fleiss kappa means "real agreement between multiple annotators after subtracting luck-based agreement."
 
 ### Q48. What is DPO?
+![alt text](DPO.png)
 
 Simple definition:
 - DPO means Direct Preference Optimization.
@@ -1909,6 +1910,69 @@ Quick comparison: DPO vs RLHF
 | Compute/ops cost | Lower in many setups | Higher in many setups |
 | Debuggability | Easier for many teams | Harder due to more moving parts |
 | Typical use case | Fast, practical preference alignment | Advanced control when full RL setup is justified |
+
+### Q49. What is RLHF?
+
+Simple definition (beginner):
+- RLHF means Reinforcement Learning from Human Feedback.
+- It teaches a model to produce responses people prefer, not just responses that look fluent.
+
+Core intuition (mid-level):
+- First, humans compare two model responses and choose the better one.
+- Then we train a reward model that learns to score responses like those human choices.
+- Finally, we update the model policy with reinforcement learning so it produces higher-reward outputs more often.
+
+Technical understanding (senior-level):
+- RLHF is typically a post-SFT alignment stage.
+- Common pipeline:
+1. Supervised fine-tuned policy as starting point
+2. Preference dataset with chosen vs rejected responses
+3. Reward model training from preference pairs
+4. Policy optimization (often PPO) to maximize reward
+5. KL regularization against a reference policy to limit destructive drift
+- Practical risks include reward hacking, over-optimization, and alignment tax if utility is reduced too much.
+
+Practical example:
+1. Prompt: "How do I safely dispose old laptop batteries?"
+2. Humans prefer a response that gives safe, legal disposal guidance over a vague or unsafe response.
+3. Reward model assigns higher score to the safe response.
+4. RL update pushes policy toward similar safe, useful responses in future prompts.
+
+Interview-ready one-liner summary:
+RLHF is a post-SFT alignment method that learns a reward signal from human preferences and then uses RL (usually PPO) to optimize model behavior toward more helpful, safer, and policy-compliant outputs.
+
+### Q50. How do you create an agent workflow that pushes code to an existing Git repo and then refreshes to continue cleanly?
+
+Simple definition (beginner):
+- Create a small automation flow that does Git status checks, commits your changes, pushes to remote, and then updates local branch from remote.
+- The goal is consistent, repeatable syncing so your local and remote stay aligned.
+
+Core intuition (mid-level):
+- Safe Git automation is a sequence, not one command.
+- First validate branch and remote, then commit and push, then refresh local with a non-destructive pull strategy.
+- This prevents accidental overwrites and reduces merge confusion.
+
+Technical understanding (senior-level):
+- A robust agent should enforce these steps:
+1. Verify repo exists and remote origin is configured.
+2. Check clean/dirty state and block if unresolved conflicts exist.
+3. Stage intended files and create atomic commit message.
+4. Push to tracked branch (for example main).
+5. Refresh local with `git fetch` + `git pull --rebase` (or team standard).
+6. Re-check status and report ahead/behind/conflict state.
+- Add guardrails:
+1. Never run destructive commands automatically (`reset --hard`, force push) without explicit approval.
+2. Fail fast on auth/permission errors.
+3. Log each step for auditability.
+
+Practical example:
+1. Developer finishes updates in local workspace.
+2. Agent runs: status -> add/commit -> push origin main.
+3. Agent runs: fetch -> pull --rebase.
+4. Agent prints final state: branch synced and ready for next commit cycle.
+
+Interview-ready one-liner summary:
+A production-ready Git sync agent is a guarded workflow that validates repo state, performs atomic commit-and-push, refreshes local from remote with a safe pull strategy, and reports final sync status without destructive defaults.
 
 ---
 

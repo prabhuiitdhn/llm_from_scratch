@@ -104,11 +104,11 @@ def average_reward(policy_w: List[float], reward_w: List[float], samples: List[L
 
 def main() -> None:
     pairs = build_pairs()
-    reward_w = train_reward_model(pairs)
+    reward_w = train_reward_model(pairs) # this is the reward model training step, which learns to assign higher scores to the chosen responses based on their features.
 
     # Start from SFT-like policy.
-    policy_w = [0.3, 0.2, -0.1]
-    old_policy_w = list(policy_w)
+    policy_w = [0.3, 0.2, -0.1] # initial policy weights that slightly favor factuality and format, and slightly penalize unsafe tendency
+    old_policy_w = list(policy_w) # old policy weights for KL penalty, updated after each step
 
     # "On-policy" toy samples (feature vectors of generated responses).
     samples = [
@@ -125,8 +125,12 @@ def main() -> None:
     print(f"Initial policy weights: {policy_w}")
 
     for step in range(1, 11):
-        obj = ppo_style_update(policy_w, old_policy_w, reward_w, samples)
-        rew = average_reward(policy_w, reward_w, samples)
+        obj = ppo_style_update(policy_w, old_policy_w, reward_w, samples) # this is the policy update step, which adjusts the policy weights to increase the PPO-style objective that combines reward improvement and stability constraints.
+        """
+        obj represents the average PPO-style objective value across the samples for this update step.
+        A higher obj indicates a better tradeoff between improving reward and maintaining stability (not deviating
+        """
+        rew = average_reward(policy_w, reward_w, samples) # average reward of current policy on the samples, which should generally improve over time as we optimize the policy weights to increase reward.
         print(f"step={step:02d} obj={obj:.4f} avg_reward={rew:.4f} policy_w={policy_w}")
         old_policy_w = list(policy_w)
 

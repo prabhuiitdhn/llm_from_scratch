@@ -1974,6 +1974,95 @@ Practical example:
 Interview-ready one-liner summary:
 A production-ready Git sync agent is a guarded workflow that validates repo state, performs atomic commit-and-push, refreshes local from remote with a safe pull strategy, and reports final sync status without destructive defaults.
 
+### Q51. What is a preference_dataset_pipeline?
+
+Simple definition (beginner):
+- A preference dataset pipeline is the step-by-step process that turns raw preference examples into clean training data for alignment methods like DPO or RLHF.
+- It makes sure your `prompt`, `chosen`, and `rejected` data is usable and trustworthy.
+
+Core intuition (mid-level):
+- Raw human feedback data is often noisy, duplicated, inconsistent, or missing fields.
+- A pipeline standardizes the data format, removes bad rows, and splits it into train/validation sets.
+- Better pipeline quality usually means better alignment quality.
+
+Technical understanding (senior-level):
+- A strong preference dataset pipeline typically includes:
+1. Ingestion: load JSONL/CSV/DB feedback data
+2. Validation: enforce schema (`prompt`, `chosen`, `rejected`, optional metadata)
+3. Cleaning: remove empty/invalid rows, normalize text, filter policy-ambiguous cases
+4. Deduplication: remove near-duplicates to reduce bias
+5. Slicing/tags: label by category (safety, factual, format, long-context)
+6. Splitting: create clean train/val/test splits with no leakage
+7. Reporting: generate quality metrics (counts, drop reasons, agreement stats)
+8. Versioning: save deterministic artifacts for reproducible training
+
+Practical example:
+1. You collect 100,000 preference pairs from annotation.
+2. Pipeline drops malformed rows, deduplicates repeated prompts, and normalizes whitespace.
+3. It creates train/val JSONL files plus a quality report showing acceptance and rejection reasons.
+4. DPO training then uses these processed files instead of raw annotation dumps.
+
+Interview-ready one-liner summary:
+A preference dataset pipeline is the data engineering backbone of alignment: it validates, cleans, deduplicates, slices, splits, and versions raw preference feedback into reliable training-ready datasets for DPO/RLHF.
+
+### Q52. If higher temperature gives more diversity, why should the judge model usually use lower temperature?
+
+Simple definition (beginner):
+- Higher temperature is useful for generating different candidate answers.
+- Lower temperature is useful for judging because the judge should be consistent, not creative.
+
+Core intuition (mid-level):
+- Candidate models are supposed to explore different response styles and quality levels.
+- The judge model is supposed to compare them reliably using the same standard every time.
+- If the judge uses high temperature, the same A/B pair may get different winners on different runs.
+
+Technical understanding (senior-level):
+- In preference data generation, diversity and consistency serve different roles.
+1. Candidate generation benefits from controlled randomness because it surfaces alternative outputs.
+2. Judge evaluation benefits from low variance because label quality depends on repeatability.
+- A high-temperature judge increases label noise, weakens preference signal, and can hurt downstream DPO/RLHF training.
+- In practice, teams often run candidate models at moderate or different temperatures, while keeping the judge near deterministic settings such as 0.0 to 0.2.
+
+Practical example:
+1. Model A uses temperature 0.2 and produces a stable, conservative answer.
+2. Model B uses temperature 0.8 and produces a more varied answer.
+3. Judge model uses temperature 0.1 so it consistently chooses based on helpfulness, correctness, and safety.
+4. If the judge also used 0.8, repeated runs could flip winners and create noisy preference labels.
+
+Interview-ready one-liner summary:
+Use higher temperature to create candidate diversity, but lower temperature for the judge so preference labels stay stable, repeatable, and useful for alignment training.
+
+### Q53. What does temperature mean in generation, and how do different temperatures help model A, model B, and the judge model?
+
+Simple definition (beginner):
+- Temperature controls how random the model is when choosing the next token.
+- Lower temperature makes answers more predictable and stable.
+- Higher temperature makes answers more varied and creative.
+
+Core intuition (mid-level):
+- The model assigns probabilities to possible next tokens.
+- Temperature reshapes those probabilities.
+- Low temperature makes the top choices dominate more.
+- High temperature flattens the distribution, so less likely tokens have a better chance of being selected.
+
+Technical understanding (senior-level):
+- Temperature is a decoding-time control, not a training-time weight update.
+- It changes sampling behavior without changing model parameters.
+- In A/B preference generation, different temperatures help create controlled contrast:
+1. Model A at lower temperature gives a conservative baseline
+2. Model B at higher temperature gives a more diverse alternative
+3. Judge model at very low temperature gives more repeatable labels
+- This setup increases candidate diversity while keeping the evaluation signal stable.
+
+Practical example:
+1. Model A at temperature 0.2 may produce a concise, safe, literal answer.
+2. Model B at temperature 0.8 may produce a richer but more variable answer.
+3. Judge model at temperature 0.1 compares both and picks a winner consistently.
+4. If all three use the same model and same temperature, outputs and judgments may become too similar or noisy.
+
+Interview-ready one-liner summary:
+Temperature is a decoding knob that controls randomness: use lower temperature for stable baselines and judges, and higher temperature for candidate diversity when generating preference pairs.
+
 ---
 
 ## 16. Practical language for senior interviews

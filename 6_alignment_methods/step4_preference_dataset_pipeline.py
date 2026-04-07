@@ -180,6 +180,11 @@ def main() -> None:
     ap.add_argument("--train-ratio", type=float, default=0.85)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--make-sample", action="store_true")
+    ap.add_argument(
+        "--strict-input",
+        action="store_true",
+        help="Fail if input file is missing instead of auto-generating starter data.",
+    )
     args = ap.parse_args()
 
     if args.make_sample:
@@ -188,9 +193,12 @@ def main() -> None:
         return
 
     if not args.input.exists():
-        raise FileNotFoundError(
-            f"Input not found: {args.input}. Use --make-sample to generate starter data."
-        )
+        if args.strict_input:
+            raise FileNotFoundError(
+                f"Input not found: {args.input}. Use --make-sample to generate starter data."
+            )
+        generate_sample_input(args.input)
+        print(f"Input not found. Auto-generated starter data at: {args.input}")
 
     records, issues = load_jsonl(args.input)
     before = len(records)

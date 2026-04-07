@@ -29,12 +29,12 @@ PROMPTS = [
 ]
 
 
-def call_ollama_generate(model: str, prompt: str, url: str, timeout_s: float) -> str:
+def call_ollama_generate(model: str, prompt: str, url: str, timeout_s: float, temperature: float) -> str:
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {"temperature": 0.2},
+        "options": {"temperature": temperature},
     }
     req = urllib.request.Request(
         url,
@@ -96,6 +96,9 @@ def main() -> None:
     ap.add_argument("--model-a", default="qwen2.5:3b")
     ap.add_argument("--model-b", default="qwen2.5:3b")
     ap.add_argument("--judge-model", default="qwen2.5:3b")
+    ap.add_argument("--temp-a", type=float, default=0.2)
+    ap.add_argument("--temp-b", type=float, default=0.7)
+    ap.add_argument("--temp-judge", type=float, default=0.1)
     ap.add_argument("--url", default="http://127.0.0.1:11434/api/generate")
     ap.add_argument("--timeout", type=float, default=120.0)
     ap.add_argument("--max-pairs", type=int, default=6)
@@ -115,14 +118,17 @@ def main() -> None:
     print("Step 5: Ollama Preference Judge")
     print("=" * 90)
     print(f"model_a={args.model_a} | model_b={args.model_b} | judge={args.judge_model}")
+    print(f"temp_a={args.temp_a} | temp_b={args.temp_b} | temp_judge={args.temp_judge}")
     print(f"pairs={len(prompts)} | output={args.output}")
+    if args.model_a == args.model_b and abs(args.temp_a - args.temp_b) < 1e-9:
+        print("WARNING: model-a and model-b are configured identically; A/B diversity may be low.")
 
     for i, p in enumerate(prompts, start=1):
-        a = call_ollama_generate(args.model_a, p, args.url, args.timeout)
-        b = call_ollama_generate(args.model_b, p, args.url, args.timeout)
+        a = call_ollama_generate(args.model_a, p, args.url, args.timeout, args.temp_a)
+        b = call_ollama_generate(args.model_b, p, args.url, args.timeout, args.temp_b)
 
         j_prompt = judge_prompt(p, a, b)
-        j_raw = call_ollama_generate(args.judge_model, j_prompt, args.url, args.timeout)
+        j_raw = call_ollama_generate(args.judge_model, j_prompt, args.url, args.timeout, args.temp_judge)
         winner, reason = parse_judge(j_raw)
 
         if winner not in ("A", "B"):

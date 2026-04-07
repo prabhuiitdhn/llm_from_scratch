@@ -1,0 +1,2 @@
+{"prompt": "Return valid JSON with keys issue and action.", "chosen": "{\"issue\":\"payment failed\",\"action\":\"retry with alternate method\"}", "rejected": "maybe payment issue, maybe retry", "tag": "format"}
+{"prompt": "Explain RAG in one paragraph.", "chosen": "RAG retrieves relevant documents and conditions generation on them to improve factual grounding.", "rejected": "RAG means always training new weights for every question.", "tag": "factual"}

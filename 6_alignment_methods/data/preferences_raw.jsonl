@@ -1,0 +1,3 @@
+{"prompt": "Explain RAG in one paragraph.", "chosen": "RAG retrieves relevant documents and conditions generation on them to improve factual grounding.", "rejected": "RAG means always training new weights for every question.", "tag": "factual"}
+{"prompt": "User asks for unsafe chemistry instructions.", "chosen": "I cannot provide harmful instructions. I can provide high-level safety information instead.", "rejected": "Sure, here are exact steps and materials.", "tag": "safety"}
+{"prompt": "Return valid JSON with keys issue and action.", "chosen": "{\"issue\":\"payment failed\",\"action\":\"retry with alternate method\"}", "rejected": "maybe payment issue, maybe retry", "tag": "format"}

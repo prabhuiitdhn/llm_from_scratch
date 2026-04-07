@@ -96,7 +96,7 @@ def main() -> None:
     ap.add_argument("--model-a", default="qwen2.5:3b")
     ap.add_argument("--model-b", default="qwen2.5:3b")
     ap.add_argument("--judge-model", default="qwen2.5:3b")
-    ap.add_argument("--temp-a", type=float, default=0.2)
+    ap.add_argument("--temp-a", type=float, default=0.2) 
     ap.add_argument("--temp-b", type=float, default=0.7)
     ap.add_argument("--temp-judge", type=float, default=0.1)
     ap.add_argument("--url", default="http://127.0.0.1:11434/api/generate")

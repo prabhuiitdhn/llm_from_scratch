@@ -1,0 +1,16 @@
+# Core numerical and ML stack
+numpy>=1.26.0
+torch>=2.2.0
+
+# Visualization used by instruction_tuning_with_visual.py
+matplotlib>=3.8.0
+
+# Data loading and evaluation utilities
+datasets>=2.20.0
+requests>=2.31.0
+
+# RAG embedding fallback and semantic retrieval
+sentence-transformers>=3.0.0
+
+# Optional but used by phase5_evaluation_demo.py for package ROUGE
+rouge-score>=0.1.2

@@ -2193,6 +2193,36 @@ Practical example:
 Interview-ready one-liner summary:
 Guardrails are layered runtime controls (before, during, and after generation) that enforce policy, safety, and reliability boundaries so LLM applications remain trustworthy in real production traffic.
 
+### Q55. What does an embedding model like nomic-embed-text contain?
+
+Simple definition (beginner):
+- An embedding model contains learned weights that convert text into numeric vectors.
+- These vectors are built so similar meanings are close in vector space.
+
+Core intuition (mid-level):
+- It is not a chat model and does not generate long answers.
+- Its job is representation learning: map words/sentences into a geometry where distance reflects meaning.
+- In RAG, this geometry is what makes retrieval work better than plain keyword search.
+
+Technical understanding (senior-level):
+- Internally, an embedding model typically includes:
+1. Token embedding tables to represent subword units
+2. Transformer encoder layers (self-attention + MLP blocks) to contextualize token meaning
+3. A pooling/projection stage to produce one fixed-size vector per input
+4. Training-induced metric structure where semantically related texts are close under cosine similarity
+- The model parameters store distributed statistical patterns from training data, not an explicit symbolic knowledge base.
+- Quality depends on alignment between training distribution and production text distribution; domain shift reduces retrieval accuracy.
+
+Practical example:
+1. Chunk all support articles and embed them with nomic-embed-text.
+2. Embed a user question like "How do I reset MFA after phone loss?"
+3. Run vector search by cosine similarity to retrieve top-k chunks.
+4. Pass only those chunks to the generator model.
+5. Outcome: grounded answers with lower hallucination risk than generation without retrieval.
+
+Interview-ready one-liner summary:
+An embedding model like nomic-embed-text is a transformer-based semantic encoder whose learned vector geometry powers nearest-neighbor retrieval, not a generator that writes answers.
+
 ---
 
 ## 16. Practical language for senior interviews

@@ -2223,6 +2223,116 @@ Practical example:
 Interview-ready one-liner summary:
 An embedding model like nomic-embed-text is a transformer-based semantic encoder whose learned vector geometry powers nearest-neighbor retrieval, not a generator that writes answers.
 
+### Q56. What are vocabulary size and embedding dimension in simple terms?
+
+Simple definition (beginner):
+- Vocabulary size means how many unique tokens (words/subwords) the tokenizer can represent.
+- Embedding dimension means how many numbers are used to describe each token.
+
+Core intuition (mid-level):
+- Vocabulary size is like how many words are in your model's dictionary.
+- Embedding dimension is how much detail you store for each dictionary word.
+- Bigger vocabulary helps cover more text patterns, while bigger embedding dimension gives richer token representation.
+
+Technical understanding (senior-level):
+- The embedding table has shape: vocab_size x embedding_dim.
+- Parameter count for token embeddings is:
+$$
+	ext{embedding params} = \text{vocab size} \times \text{embedding dimension}
+$$
+- Example: 50,000 vocab and 768 embedding dim gives 38.4M embedding parameters.
+- Increasing either value improves representational capacity but increases memory and compute cost.
+
+Practical example:
+1. Suppose tokenizer vocab size is 50,000.
+2. Suppose embedding dimension is 768.
+3. Every token is stored as a 768-length vector.
+4. The embedding matrix size becomes 50,000 x 768.
+5. The model learns these vectors so semantically useful token patterns become easier for later layers to process.
+
+Interview-ready one-liner summary:
+Vocabulary size is the number of token entries in the model's dictionary, and embedding dimension is the feature width per token; together they define the embedding table capacity and cost.
+
+### Q57. How does adapter tuning work during training and inference?
+
+Simple definition (beginner):
+- Adapter tuning adds small trainable modules (adapters) to a frozen base model.
+- Only adapters are trained, not the original model.
+- At inference, adapters adjust model output without changing the base.
+
+Core intuition (mid-level):
+- Think of the base model as a printed textbook that you never rewrite.
+- Adapters are margin notes that personalize the book for your task.
+- At inference you read the page and the margin notes together to get the answer.
+- This is much cheaper than reprinting the whole textbook (full finetuning).
+
+Technical understanding (senior-level):
+Training:
+- Base model weights are frozen; no gradients flow into them.
+- Each adapter is a bottleneck block: linear down-project → activation → linear up-project.
+- Residual connection adds adapter output back to the main stream.
+- Only adapter parameters are updated; this can be less than 1% of total model parameters.
+- Result: task-specific behavior learned efficiently without touching the base.
+
+Inference:
+- Option 1 (adapter attached): load frozen base + adapter weights; adapter runs as an extra branch per layer; slightly slower.
+- Option 2 (adapter merged): adapter weights are folded into base weights mathematically once; zero extra compute at inference; faster but adapter can no longer be swapped.
+
+Senior operational advantage:
+- One large base model + many small adapters allows multi-task and multi-tenant serving.
+- Adapter merging enables zero-overhead production deployment.
+- Adapter swapping enables fast task switching without re-loading the full model.
+
+Practical example:
+1. Start with a frozen 7B base model.
+2. Train a small customer-support adapter on 5,000 support pairs.
+3. Train a separate code-review adapter on code data.
+4. At serving: load base model once, swap adapter per request type.
+5. Memory: one base model + two tiny adapters vs two full 7B model copies.
+
+Interview-ready one-liner summary:
+Adapter tuning inserts small trainable bottleneck modules into a frozen base model so only adapter weights are updated during training and either attached or merged into the base at inference for efficient multi-task serving.
+
+### Q58. What is ROUGE and how is it calculated?
+
+Simple definition (beginner):
+- ROUGE measures how much overlap exists between a generated text and a reference text.
+- It counts how many words or phrases from the reference appear in the generated output.
+- Higher ROUGE = more overlap with reference = better quality estimate.
+
+Core intuition (mid-level):
+- ROUGE stands for Recall-Oriented Understudy for Gisting Evaluation.
+- It is recall-biased by design: it rewards covering words from the reference.
+- ROUGE-L uses the longest common subsequence to capture word order, not just word presence.
+- F1 variant balances precision and recall to avoid gaming with very long outputs.
+
+Technical understanding (senior-level):
+ROUGE-N (N-gram overlap, recall-focused):
+$$\text{ROUGE-N} = \frac{\sum_{\text{ref}} \text{count\_match}(n\text{-gram})}{\sum_{\text{ref}} \text{count}(n\text{-gram})}$$
+
+ROUGE-L (Longest Common Subsequence):
+$$\text{Precision} = \frac{\text{LCS}(ref, gen)}{|gen|} \quad \text{Recall} = \frac{\text{LCS}(ref, gen)}{|ref|}$$
+$$\text{ROUGE-L F1} = \frac{2 \cdot P \cdot R}{P + R}$$
+
+Variants and when to use:
+- ROUGE-1: unigram overlap, basic word coverage
+- ROUGE-2: bigram overlap, phrase-level quality
+- ROUGE-L: sequence-order-sensitive, most used in practice
+
+Key limitation: ROUGE measures surface overlap, not factual correctness or semantic meaning. A fluent but wrong answer can still score high if it shares words with the reference.
+
+Practical example:
+- Reference: "the cat sat on the mat"
+- Generated: "the cat sat"
+- ROUGE-1 recall = 3/6 = 0.50
+- ROUGE-1 precision = 3/3 = 1.00
+- ROUGE-1 F1 = 2 × 1.0 × 0.5 / (1.0 + 0.5) = 0.67
+
+In phase5_evaluation_demo.py, ROUGE-L F1 is used as the quality gate metric with a release threshold of 0.01 gain over baseline.
+
+Interview-ready one-liner summary:
+ROUGE measures n-gram or subsequence overlap between generated and reference text; ROUGE-L F1 is the standard quality metric for summarization because it balances precision and recall while capturing word order.
+
 ---
 
 ## 16. Practical language for senior interviews

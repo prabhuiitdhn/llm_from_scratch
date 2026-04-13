@@ -577,3 +577,535 @@ If logits behave like negative energies:
 - Increased uncertainty signal is useful, but latency and compute cost increase roughly with number of passes.
 
 ---
+
+## Q8: What is KV cache in LLM inference?
+
+### Beginner Level: Simple Intuition
+
+KV cache is the model's memory of previous tokens during generation.
+
+When the model generates text token by token, it does not need to "re-read" everything from scratch each time. It stores important attention data from past tokens and reuses it.
+
+- **K = Keys**
+- **V = Values**
+
+Think of it like this:
+- Without KV cache: you re-solve all previous steps every time.
+- With KV cache: you keep past work in notes and only solve the new step.
+
+This makes generation much faster.
+
+---
+
+### Intermediate Level: What exactly is cached
+
+In self-attention, each layer computes Query (Q), Key (K), and Value (V) vectors.
+
+At decoding step $t$:
+- You only need a new query for the current token.
+- Keys and values for tokens $1$ to $t-1$ are already known.
+
+So we cache old K and V tensors for every layer and append new K/V each step.
+
+Benefits:
+- Reduces repeated computation.
+- Greatly lowers per-token latency in autoregressive decoding.
+
+Tradeoff:
+- Cache consumes memory, growing with sequence length, layers, heads, and head dimension.
+
+---
+
+### Expert Level: Complexity and systems view
+
+Without KV cache (naive decoding):
+- At each new token, attention recomputes K/V for full prefix.
+- Total decode cost grows roughly as $O(T^3)$ across the whole generation in a naive implementation.
+
+With KV cache:
+- Prefix K/V are reused.
+- Per-step work mainly comes from attention of current query over cached prefix.
+- Total decode cost is typically discussed as roughly $O(T^2)$ over the full sequence.
+
+Memory footprint (rough intuition):
+$$\text{KV memory} \propto 2 \times L \times H \times d_h \times T \times \text{dtype bytes}$$
+Where:
+- $L$ = number of layers
+- $H$ = number of attention heads
+- $d_h$ = head dimension
+- $T$ = current context length
+
+Production implications:
+- KV cache improves throughput/latency but can become the memory bottleneck.
+- Long-context serving often needs paged KV cache, quantized KV cache, or request batching/scheduling strategies.
+
+---
+
+### Simple NLP token example
+
+Prompt: "The cat sat"
+
+Goal: generate next tokens one by one.
+
+Step 1 (predict token 4):
+- Model computes K/V for "The", "cat", "sat" and stores them.
+
+Step 2 (predict token 5 after generating "on"):
+- Without cache: recompute K/V for "The cat sat on".
+- With cache: reuse K/V for "The cat sat", compute only K/V for "on", append, and continue.
+
+Step 3 (predict token 6):
+- Reuse all cached K/V so far, add only new token's K/V.
+
+This reuse is why streaming generation can be fast.
+
+---
+
+### Quick summary
+
+- KV cache stores past attention keys and values during decoding.
+- It avoids recomputing the full prefix at every token.
+- It speeds up inference significantly, especially for long outputs.
+- The main tradeoff is extra memory usage that grows with context length.
+
+---
+
+## Q9: What is copy-on-write in memory and how is it used in KV cache handling?
+
+### Beginner Level: Simple Intuition
+
+Copy-on-write (CoW) is a memory trick that avoids unnecessary duplication.
+
+Simple analogy:
+- Imagine two people sharing a photocopy of a book.
+- They both read from one shared copy.
+- Only when someone wants to write notes in their copy does the system create a separate physical copy for that person.
+
+Before any write: one shared copy in memory.
+After a write: two separate copies (only for that person).
+
+This avoids wasteful duplication when most readers never modify the data.
+
+---
+
+### Intermediate Level: CoW in OS and LLM KV cache
+
+**In OS/general memory:**
+
+When a process is forked, the child process shares the parent's memory pages. No copying happens immediately. Only when either process tries to modify a page does the OS create a private copy of that specific page.
+
+- No write = no copy = zero extra memory cost.
+- Write happens = only that page is copied, not the whole memory.
+
+**In LLM KV cache (vLLM's paged attention):**
+
+When multiple requests share a common prefix (for example, a long system prompt), they share the same KV cache pages in memory.
+
+- All requests read from the same prefix cache pages.
+- When one request needs to extend its context differently, only then does the system copy the diverging page and let that request write to its own copy.
+
+This means:
+- 10 requests with the same system prompt = 1 copy of that prefix in memory, not 10.
+- Memory savings can be very large in production.
+
+---
+
+### Expert Level: CoW in production serving
+
+In vLLM and similar systems, KV cache is managed as fixed-size pages (like OS virtual memory pages).
+
+Shared prefix example:
+```
+System prompt: "You are a helpful assistant. Answer briefly."
+
+Request A: [system prompt] + "What is Python?"
+Request B: [system prompt] + "What is Java?"
+Request C: [system prompt] + "What is Rust?"
+```
+
+Without CoW:
+- 3 separate full copies of the system prompt KV cache in GPU memory.
+- Wastes memory proportional to (num_requests × prefix_length).
+
+With CoW:
+- 1 shared copy of the system prompt KV pages.
+- Each request gets its own pages only from where they diverge.
+- Shared pages are marked read-only until a request modifies them.
+- On divergence, the system allocates a new page and copies only that page.
+
+Memory saving:
+$$\text{Saved memory} \approx (\text{num\_requests} - 1) \times \text{prefix\_length} \times \text{KV\_size\_per\_token}$$
+
+This is why prefix caching and CoW together are critical for high-throughput LLM serving with shared prompts.
+
+---
+
+### Summary table
+
+| Aspect | Without CoW | With CoW |
+|--------|-------------|----------|
+| Shared prefix memory | Duplicated per request | One shared copy |
+| Modification | Always writes to own memory | Copy only when needed |
+| Memory cost | High | Much lower for shared prefixes |
+| Complexity | Simple | Requires page tracking |
+
+CoW is one of the key reasons vLLM can serve many concurrent requests efficiently, especially when they share system prompts or few-shot examples.
+
+---
+
+## Q10: What is the token bucket algorithm and how does it prevent KV cache overload?
+
+### Beginner Level: Simple Intuition
+
+A token bucket is a rate-limiting technique borrowed from networking.
+
+Simple analogy:
+- Imagine a physical bucket that slowly fills with tokens at a steady drip (say, 10 tokens per second).
+- Every incoming request must take tokens from the bucket to be allowed in.
+- Bucket has tokens → request is admitted.
+- Bucket is empty → request waits or is rejected.
+
+This smooths out bursts. Even if 100 requests arrive at once, only as many as the bucket currently holds can enter the system.
+
+---
+
+### Intermediate Level: Why it matters for KV cache
+
+KV cache memory is finite (GPU VRAM). If too many long requests enter simultaneously:
+- KV cache fills up completely.
+- System has to evict or swap cache pages to disk.
+- Latency spikes sharply or requests start failing.
+
+The token bucket controls the **rate of new tokens entering the system**, so KV cache usage stays within safe bounds at all times.
+
+Flow:
+```
+Incoming requests → Token bucket check → Admitted to KV cache → Decoding
+         ↑                   ↓
+     Burst arrives      Excess waits or dropped
+```
+
+Without rate limiting, a sudden burst of long-context requests can exhaust all KV cache pages in seconds, crashing the server or causing severe degradation for all other users.
+
+---
+
+### Expert Level: Production serving view
+
+In LLM serving systems, the "tokens" in the bucket are mapped to concrete resources:
+- Available KV cache pages.
+- Prefill token budget per time window.
+- Concurrent sequence slots.
+
+Combined with paged KV cache and copy-on-write, the token bucket acts as the **admission control layer** — the first gate before a request touches any GPU memory.
+
+Three-layer defense:
+
+| Layer | Role |
+|-------|------|
+| Token bucket | Controls request admission rate |
+| Paged KV cache | Manages memory in fixed blocks |
+| Copy-on-write | Deduplicates shared prefix pages |
+
+Together they prevent three failure modes:
+
+1. **Memory overflow**: too many concurrent long sequences exhaust VRAM.
+2. **Latency spikes**: bursty admission causes cache thrashing and eviction storms.
+3. **Head-of-line blocking**: one huge request occupying all cache pages starves all others.
+
+Practical tuning:
+- Bucket refill rate ≈ target sustained token throughput.
+- Bucket max capacity ≈ acceptable burst size before degradation.
+- Excess requests should be queued with priority or shed gracefully with a 429 response.
+
+---
+
+### One-line summary
+
+The token bucket is a **flow control valve** — it ensures the rate of incoming work never exceeds what the KV cache can safely hold at any moment, preventing memory overflow and latency spikes under burst traffic.
+
+---
+
+## Q11: What is a batching window and how does it affect throughput vs latency in LLM serving?
+
+### Simple words first
+
+The server waits up to a fixed time (say 20ms), collecting incoming requests before processing them together as one batch. If traffic is light, only 1–2 requests arrive in that window, so the batch stays small. Waiting longer (50ms) gives more requests time to arrive, filling the batch better and improving throughput — but each request waits a bit longer before it starts being processed.
+
+---
+
+### Beginner Level: The bus stop analogy
+
+Think of a bus that departs every 20 minutes regardless of how many people are waiting.
+
+- If only 1 person shows up in 20 minutes, the bus leaves almost empty.
+- If you wait 50 minutes instead, more people accumulate and the bus leaves fuller.
+- Fuller bus = more efficient trip (better throughput).
+- But passengers who arrived early waited longer (higher latency).
+
+In LLM serving:
+- Bus = one batch of requests processed together on the GPU.
+- Passengers = individual inference requests.
+- Departure interval = batching window (max_wait_ms).
+
+---
+
+### Intermediate Level: Why batch size matters for GPU efficiency
+
+GPUs are designed for parallel computation. Processing 8 requests at once is nearly as fast as processing 1, because the GPU has thousands of cores that would otherwise sit idle.
+
+When average batch size is 1.39 out of a max of 8:
+- GPU is running at roughly 17% of its batch capacity.
+- Most of its parallelism is wasted.
+- Throughput (requests per second) is far below the hardware limit.
+
+Increasing `max_wait_ms` from 20ms to 50ms:
+- More requests accumulate before each batch starts.
+- Average batch size increases (for example, from 1.4 to 3–5).
+- GPU utilization improves.
+- Throughput goes up.
+
+Tradeoff:
+- Every request now waits up to 50ms before processing even begins.
+- For latency-sensitive users, this extra wait is noticeable.
+
+---
+
+### Expert Level: KV cache and scheduler interaction
+
+Batching windows interact directly with KV cache allocation:
+
+1. **Prefill phase**: all tokens in the prompt are processed together. Larger batches share GPU memory bandwidth more efficiently here.
+2. **Decode phase**: each step generates one token per sequence. Batched decoding amortizes the cost of loading model weights from GPU memory across all sequences in the batch.
+
+When batch size is too small:
+- Model weights are loaded from GPU memory for just 1–2 sequences.
+- Memory bandwidth is the bottleneck, not compute.
+- Effective hardware utilization drops dramatically.
+
+Scheduler tuning levers:
+
+| Parameter | Effect |
+|-----------|--------|
+| `max_wait_ms` (low, e.g. 20ms) | Lower latency, smaller batches, lower throughput |
+| `max_wait_ms` (high, e.g. 50ms) | Higher latency, larger batches, higher throughput |
+| `max_batch_size` | Hard upper cap on concurrent sequences in one batch |
+
+In production, the right setting depends on your SLA:
+- **Latency-sensitive** (real-time chat): keep `max_wait_ms` low (10–20ms).
+- **Throughput-sensitive** (batch jobs, offline processing): increase `max_wait_ms` (50–200ms).
+- **Mixed traffic**: use dynamic batching with priority queues — urgent requests bypass the wait window.
+
+Connection to KV cache:
+- Larger batches consume more KV cache simultaneously.
+- The token bucket (Q10) acts as a safety valve ensuring the batch scheduler never admits more sequences than the KV cache can hold.
+- These two mechanisms must be jointly tuned for stable high-throughput serving.
+
+---
+
+### Quick summary
+
+| Concept | Meaning |
+|---------|---------|
+| Batching window | Time to wait and collect requests before processing |
+| Small window | Fast response, poor GPU utilization |
+| Large window | Slower response, efficient GPU utilization |
+| Average batch size 1.39 | GPU is mostly idle between requests |
+| Increasing max_wait_ms | Trades a little latency for much better throughput |
+
+---
+
+## Q12: How does hash ring routing reduce latency in HTTP LLM inference?
+
+### Simple words first
+
+Hash ring routing tries to send repeated requests from the same user/session to the same inference server.
+
+That server already has useful cache (KV cache, prefix cache, session context), so it can respond faster instead of recomputing from scratch.
+
+---
+
+### Beginner Level: Easy example
+
+Suppose you have 3 servers:
+- S1, S2, S3
+
+User A sends multiple chat requests.
+
+Without stable routing (random load balancing):
+- Request 1 -> S1
+- Request 2 -> S3
+- Request 3 -> S2
+
+Each server sees User A as new, so cache reuse is poor.
+
+With hash ring routing:
+- User A hashes to S2, so most User A requests go to S2.
+
+Now S2 reuses User A's cached context and responds faster.
+
+---
+
+### Intermediate Level: Why latency drops
+
+In LLM serving, repeated requests benefit from locality:
+- Prefix/system prompt cache reuse
+- KV cache reuse (or at least better warm memory behavior)
+- Session-level metadata reuse
+
+Typical effect:
+- First request can be cold (higher latency)
+- Next requests become warm (lower latency)
+
+If routing keeps bouncing across servers, each request becomes partially cold again.
+
+Hash ring preserves locality, reducing average latency and especially tail latency (p95/p99).
+
+---
+
+### Expert Level: Scaling behavior and remapping stability
+
+Hash ring places servers and session keys on a logical circle using hashes.
+Each key is assigned to the next server clockwise.
+
+Major production advantage:
+- When a server is added/removed, only a small subset of keys remap.
+- Most sessions stay on their previous server.
+- Most warm caches survive scaling events.
+
+Compared to simple modulo routing, this avoids mass remapping and large cold-cache latency spikes during autoscaling or node failures.
+
+Operational note:
+- Use virtual nodes per server for better load balance.
+- Pair hash-ring routing with session affinity TTL and health-aware failover.
+
+---
+
+### Concrete HTTP request flow example
+
+Assume chat requests arrive as:
+- `POST /generate` with `session_id=userA`
+
+Without hash ring (random):
+- userA-1 -> S1 (cold, 800ms)
+- userA-2 -> S3 (cold-ish, 760ms)
+- userA-3 -> S2 (cold-ish, 790ms)
+
+With hash ring:
+- userA-1 -> S2 (cold, 800ms)
+- userA-2 -> S2 (warm, 260ms)
+- userA-3 -> S2 (warm, 240ms)
+
+Result: much lower average latency and fewer latency spikes.
+
+---
+
+### Quick summary
+
+- Hash ring keeps related requests on the same server.
+- Same-server locality improves cache reuse.
+- Better cache reuse means lower inference latency.
+- Minimal remapping during scale changes prevents cold-cache storms.
+
+---
+
+## Q13: How do virtual nodes help achieve better session affinity?
+
+### Simple words first
+
+Virtual nodes mean each real server appears many times on the hash ring, not just once.
+
+This makes session distribution much more even. Sessions still stay sticky to one backend, but the sticky sessions are spread fairly across all servers.
+
+---
+
+### Beginner Level: Easy intuition
+
+Without virtual nodes:
+- Server A, B, C each get one position on the ring.
+- If spacing is unlucky, one server may get a very large chunk of sessions.
+
+With virtual nodes:
+- Each server gets many points (for example, 100 points each).
+- Large chunks are split into many smaller pieces.
+- Sessions are distributed more evenly.
+
+So session affinity remains, but hotspot risk goes down.
+
+---
+
+### Intermediate Level: Why session quality improves
+
+Session affinity aims to keep the same session on the same worker for cache reuse.
+
+Virtual nodes improve this in practice:
+
+1. Better load balance
+- Sticky sessions are spread more evenly, so fewer overloaded workers.
+
+2. Fewer hot partitions
+- High-traffic session IDs are less likely to cluster on one server.
+
+3. Lower tail latency
+- Balanced workers reduce queueing delays, improving p95 and p99 latency.
+
+4. Better cache effectiveness
+- Because no single worker is overloaded, KV and prefix caches are used more predictably.
+
+---
+
+### Expert Level: Scaling stability and remap behavior
+
+With one node per server, consistent hashing can still be statistically uneven.
+Using many virtual nodes approximates weighted uniform partitioning of keyspace.
+
+When scaling events happen (add/remove server):
+- Remapped sessions are drawn from many tiny segments rather than a few huge segments.
+- Cache disruption is spread out across the fleet.
+- You avoid a single-server cold-start shock.
+
+Operational guidance:
+- Use virtual-node count proportional to cluster size (commonly dozens to hundreds per server).
+- Support weighted virtual nodes so stronger servers own more ring space.
+- Combine with health-aware rerouting and short affinity TTL fallback.
+
+---
+
+### Mini example
+
+Assume 3 servers handling chat sessions:
+- One-point ring distribution might become: A=50%, B=20%, C=30%
+- With 100 virtual nodes each: close to A=33%, B=33%, C=33%
+
+Effect:
+- Sessions remain sticky.
+- Load is fair.
+- Warm-cache benefit is preserved without overloading one server.
+
+---
+
+### One-line takeaway
+
+Virtual nodes do not replace session affinity; they make it stable and scalable by evenly spreading sticky sessions across servers.
+
+---
+
+## Q14: What is session affinity?
+
+Session affinity means a user's repeated requests are routed to the same backend server for some time.
+
+Simple example:
+1. First request from a user goes to Server B.
+2. Next requests from that same session also go to Server B (instead of random servers).
+
+Why it helps:
+- Reuses in-memory state (session data, warm cache, KV/prefix cache in LLM systems).
+- Reduces repeated setup and recomputation.
+- Often lowers latency and improves consistency.
+
+Tradeoff:
+- Better cache locality.
+- But load can become uneven if too many sticky sessions land on one server.
+
+In one line: session affinity is sticky routing that keeps a session on the same server.
+
+---

@@ -95,7 +95,7 @@ def self_attention(token_vectors: Matrix, w_q: Matrix, w_k: Matrix, w_v: Matrix)
 
 def run_demo() -> None:
     # Tiny sentence: each row is a one-hot encoded token (vocab_size=3).
-    tokens = ["I", "love", "NLP"]
+    tokens = ["I", "love", "NLP"] # token IDs: 0, 1, 2
     x: Matrix = [
         [1.0, 0.0, 0.0],  # I (one-hot: position 0)
         [0.0, 1.0, 0.0],  # love (one-hot: position 1)

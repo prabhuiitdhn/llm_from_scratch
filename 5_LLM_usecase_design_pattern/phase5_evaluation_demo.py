@@ -7,10 +7,10 @@ What this script demonstrates:
 3) Slice-based analysis on long-context samples
 4) Metrics beyond loss:
    - quality (ROUGE-L F1) # ROUGE-L F1 is a common metric for summarization quality, capturing both precision and recall of longest common subsequence between generated summary and reference summary. A gain of 0.01 (1 percentage point) is a modest improvement that can be meaningful in this context.
-   - p95 latency 
-   - hallucination proxy
-   - refusal error
-   - format/schema validity
+   - p95 latency  # p95 latency is a common performance metric that captures the worst-case latency experienced by 95% of requests, providing insight into tail latency and user experience under load.
+   - hallucination proxy # fraction of novel unigrams in summary not present in source (practical proxy for hallucination rate, though not perfect)
+   - refusal error # fraction of prompts where the model refuses to generate a response
+   - format/schema validity # checks if the generated output adheres to the expected format or schema
 
 Dataset:
 - CNN/DailyMail via Hugging Face datasets (open-source).

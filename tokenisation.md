@@ -96,6 +96,68 @@ Subword/wordpiece : mostly used for handling misspelling or multilingual data
 example: unfriendly
 Un, friend, ly
 
+Explanation:
+WordPiece breaks `"unfriendly"` into subword pieces that already exist in the vocabulary:
+`"unfriendly"` → `["un", "friend", "ly"]`
+Each piece is a meaningful morpheme (prefix, root, suffix) that the tokenizer learned from training data.
+
+Why this handles misspelling:
+- `"unfrendly"` (misspelled) → `["un", "fre", "nd", "ly"]`
+- Word-level tokenizer: entire word → `<UNK>` (total failure)
+- Subword tokenizer: splits into known pieces → model still gets partial signal from `"un"` and `"ly"`
+- The model can still infer meaning from recognizable subwords even when the full word is misspelled.
+
+Why this handles multilingual data:
+- `"spielen"` (German: to play) → `["spiel", "en"]`
+- `"spielplatz"` → `["spiel", "platz"]`
+- Shared subwords across languages let the model transfer knowledge without needing every word form in every language as a separate vocabulary entry.
+
+How WordPiece decides where to split:
+1. Start with the full word. If it's in vocabulary → keep as one token.
+2. If not, try the longest prefix in vocabulary, then tokenize the remainder.
+3. Continuation pieces are often marked with `##` (in BERT-style): `["un", "##friend", "##ly"]`
+
+Detailed explanation of longest-prefix matching:
+The algorithm processes a word left-to-right, always taking the longest possible match from the vocabulary first, then repeating on what's left.
+
+Step-by-step example:
+Suppose vocabulary contains: `["un", "friend", "friendly", "ly", "f", "r", "i", "e", "n", "d"]`
+
+Word: `"unfriendly"`
+- Step 1: Try full word "unfriendly" → NOT in vocab
+- Step 2: Try longest prefix: "unfriendl" → no, "unfriend" → no, ... "un" → YES ✓ → take "un"
+- Remainder: "friendly"
+- Step 3: Try "friendly" → YES ✓ (it's in vocab!) → take "friendly"
+- Remainder: "" (done)
+- Result: ["un", "friendly"]
+
+Another example where "friendly" is NOT in vocab:
+Vocabulary: `["un", "friend", "ly", "f", "r"]`
+Word: `"unfriendly"`
+- Step 1: "unfriendly" → not in vocab
+- Step 2: Longest prefix match → "un" ✓. Remainder: "friendly"
+- Step 3: "friendly" → not in vocab. Longest prefix: "friend" ✓. Remainder: "ly"
+- Step 4: "ly" → YES ✓
+- Result: ["un", "friend", "ly"]
+
+Why "longest prefix first" matters:
+
+| Strategy | Result for "friendly" | Quality |
+|---|---|---|
+| Longest prefix first | `["friend", "ly"]` | Semantically meaningful pieces |
+| Shortest prefix first | `["f", "r", "i", "e", "n", "d", "ly"]` | Too fragmented, loses meaning |
+
+Longest-match preserves the most semantic information per token, reducing sequence length and keeping meaningful units together.
+
+What happens when no prefix matches:
+If even single characters aren't in vocabulary → fall back to `<UNK>`. But in practice, byte-level or character-level fallbacks ensure this rarely happens in modern tokenizers.
+
+Senior one-liner:
+WordPiece uses greedy longest-prefix matching to maximize semantic density per token — each split captures the largest known subword, then recurses on the remainder until the full word is consumed.
+
+Key insight for interviews:
+Subword tokenization gives graceful degradation — unknown or malformed words don't collapse to a single useless `<UNK>` token. The model always gets some signal from recognizable pieces, which is why it works well for noisy real-world text, typos, and languages the tokenizer wasn't primarily trained on.
+
 ### 4.1 Tokenizer techniques from beginner to advanced
 
 Beginner level:
@@ -263,6 +325,305 @@ Senior-level interview answer:
 Memory hook:
 - Inconsistent normalization creates silent distribution shift.
 - Consistent normalization improves token stability and production reliability.
+
+### Q16. Does punctuation get added into vocabulary? How do you decide vocabulary size? Does this mean all words in the world should be in vocabulary?
+
+Yes, punctuation is included in the vocabulary. Tokens like `.`, `,`, `?`, `!`, `:` are separate vocabulary entries because they carry semantic and structural meaning — a question mark changes intent, a period signals sentence boundaries, and commas affect parsing.
+
+You do not need every word in the world. Modern NLP uses subword tokenization (BPE, WordPiece, SentencePiece), which solves this:
+1. Start with characters (a-z, digits, punctuation) — these cover anything.
+2. Merge frequent character pairs iteratively into subword tokens.
+3. Stop merging when you hit a target vocabulary size.
+
+Common vocabulary sizes: GPT-2 ~50K, LLaMA ~32K, GPT-4/cl100k ~100K.
+
+Rare/unseen words get split into known subwords. Example: `"unhappiness"` → `["un", "happi", "ness"]`. This gives open vocabulary coverage with a finite token set.
+
+Tradeoffs when choosing size:
+
+| Smaller vocab | Larger vocab |
+|---|---|
+| More tokens per sentence (longer sequences) | Fewer tokens per sentence (shorter sequences) |
+| Better generalization to rare words | More direct token-to-word mapping |
+| Smaller embedding matrix | Larger embedding matrix (more parameters) |
+
+Interview-ready summary:
+Vocabulary size is a compression tradeoff — subword tokenization lets you represent any text with a fixed-size vocabulary (typically 32K–100K), where common words are single tokens and rare words are composed from subword pieces, including punctuation as explicit tokens for structural fidelity.
+
+### Q17. What is Unicode normalization (NFC/NFKC) and why does it matter in NLP?
+
+The same visible character can be stored differently in memory. For example, the letter é can be:
+- Precomposed: single code point `U+00E9` (é as one unit)
+- Decomposed: two code points `U+0065` (e) + `U+0301` (combining accent ´)
+
+Both look identical on screen but are different byte sequences. Without normalization, a tokenizer treats them as different inputs → different token IDs → inconsistent model behavior.
+
+The four Unicode normalization forms:
+
+| Form | What it does |
+|---|---|
+| NFD | Decomposes into base + combining characters |
+| NFC | Composes into single precomposed characters (most compact) |
+| NFKD | Decomposes + replaces compatibility variants (e.g., `ﬁ` → `fi`) |
+| NFKC | Composes + replaces compatibility variants |
+
+NFC vs NFKC (the two common in NLP):
+- NFC: canonical composition. `e + ´` → `é`. Preserves meaning, picks one representation.
+- NFKC: does everything NFC does plus flattens compatibility characters: `ﬁ` → `fi`, `①` → `1`, `Ｈｅｌｌｏ` → `Hello`.
+
+Why it matters:
+1. Without normalization, the same word can get different token IDs depending on how it was typed or copied.
+2. Search/retrieval can miss exact matches.
+3. Deduplication fails on visually identical but byte-different strings.
+
+Interview-ready summary:
+Unicode normalization (typically NFKC in NLP) collapses equivalent character representations into a canonical form so that visually identical text always produces the same token IDs, preventing silent distribution mismatch between training and inference.
+
+### Q18. How is number/date normalization done in NLP?
+
+The problem: the same number or date can appear in many text forms, creating unnecessary token variation.
+- `"12/05/2026"` vs `"May 12, 2026"` vs `"2026-05-12"` — each tokenizes differently.
+- `"1,000"` vs `"1000"` vs `"1.000"` (European) — same value, different tokens.
+
+Common normalization strategies:
+
+| Strategy | Example | When to use |
+|---|---|---|
+| Canonical date format | All dates → `YYYY-MM-DD` | When exact date matters but format doesn't |
+| Placeholder replacement | `"May 12, 2026"` → `<DATE>` | When the date value itself doesn't matter (e.g., sentiment analysis) |
+| Number bucketing | `3847` → `<NUM>` | Classification tasks where exact number is noise |
+| Comma/separator removal | `1,000,000` → `1000000` | Standardize numeric representation |
+| Unit standardization | `"3.5M"` → `"3500000"` | When downstream needs consistent magnitude |
+
+Practical implementation (Python):
+- Regex replacement: `re.sub(r'\b\d+[\d,\.]*\b', '<NUM>', text)`
+- Date parsing: `dateutil.parser.parse("May 12, 2026").strftime("%Y-%m-%d")`
+- Separator removal: `re.sub(r'(\d),(\d)', r'\1\2', text)`
+
+When NOT to normalize:
+- Math/finance tasks — exact numbers are the answer.
+- NER — you need to extract the original date/number.
+- Code generation — literals must be preserved.
+- Medical dosages — `"500mg"` vs `"0.5g"` distinction matters.
+
+Interview-ready summary:
+Number/date normalization reduces surface-form variation by mapping equivalent representations to a canonical form or placeholder, improving token stability and generalization — but only when the task objective doesn't depend on the original format or exact value.
+
+### Q19. How does a vocabulary look for a large document/corpus used to train an LLM?
+
+A vocabulary for a large training corpus is a lookup table: token string → integer ID.
+
+Example vocabulary file (simplified, ~50K entries):
+```json
+{
+  "the": 0, "of": 1, "and": 2, "to": 3, "a": 4, "in": 5,
+  "Ġthe": 100, "Ġis": 101,
+  "un": 5023, "friend": 5024, "ly": 5025, "Ġhello": 8901,
+  ".": 13, ",": 14, "?": 15, "!": 16,
+  "Ġneur": 31002, "olog": 31003, "ical": 31004,
+  "<PAD>": 50255, "<UNK>": 50256, "<BOS>": 50257
+}
+```
+(`Ġ` = space prefix, meaning "this token starts a new word")
+
+Structure of a real vocabulary (e.g., GPT-2 with 50,257 tokens):
+
+| Range | What's in it | Examples |
+|---|---|---|
+| Top ~1000 | Most common full words and subwords | `the`, `is`, `of`, `ing`, `tion` |
+| ~1000–10000 | Common words + frequent subwords | `hello`, `friend`, `comput`, `ment` |
+| ~10000–30000 | Less common subwords + domain terms | `neur`, `olog`, `quant`, `ization` |
+| ~30000–50000 | Rare subwords + single characters + special | `ñ`, `♦`, byte fallbacks |
+| Special tokens | Control tokens | `<PAD>`, `<BOS>`, `<EOS>`, `<UNK>` |
+
+How it's built from a large corpus:
+1. Collect all training text (could be terabytes — web, books, code, etc.)
+2. Run BPE/WordPiece/Unigram algorithm on it:
+   - Start with base characters (~256 bytes or unicode chars)
+   - Iteratively merge most frequent pairs
+   - Stop at target size (e.g., 32K, 50K, 100K)
+3. Result: a fixed mapping file (`vocab.json` + `merges.txt`)
+
+Real files you'd see in a tokenizer directory:
+- `vocab.json` — token_string → token_id mapping
+- `merges.txt` — BPE merge rules in order (for BPE-based)
+- `tokenizer_config.json` — special tokens, max length, etc.
+- `special_tokens_map.json`
+
+Detailed explanation of vocab.json and merges.txt:
+
+These two files together define a complete BPE tokenizer.
+
+`vocab.json` — The dictionary:
+A simple JSON mapping of every token string to its unique integer ID. This is what the model actually sees — it never sees text, only these integer IDs. When you feed `"hello"`, the tokenizer looks up each piece in this file and returns the corresponding IDs.
+
+`merges.txt` — The splitting recipe:
+An ordered list of merge rules that tells the tokenizer how to build subwords from characters. Order matters — earlier rules = more frequent pairs = applied first.
+
+Example merges.txt (BPE merge rules, applied in order):
+```
+Ġ t
+i n
+Ġ a
+h e
+r e
+Ġt he
+i ng
+```
+
+How they work together at tokenization time:
+Input: `"hello"`
+- Step 1: Split into characters → `['h', 'e', 'l', 'l', 'o']`
+- Step 2: Apply merge rules in order from merges.txt:
+  - Rule "h e" → `['he', 'l', 'l', 'o']`
+  - Rule "he ll" → `['hell', 'o']`
+  - Rule "hell o" → `['hello']`
+- Step 3: Look up each merged token in vocab.json → `'hello' → 8901`
+- Result: `[8901]`
+
+Why two files instead of one:
+
+| File | Purpose |
+|---|---|
+| `vocab.json` | Maps token strings → IDs (the **what**) |
+| `merges.txt` | Defines how to split/merge text into those tokens (the **how**) |
+
+You need both because:
+- `vocab.json` alone doesn't tell you how to break `"unfriendly"` into subwords
+- `merges.txt` alone doesn't tell you what ID each piece maps to
+- Together they form a deterministic, reproducible tokenization pipeline
+
+Quick analogy:
+- `vocab.json` = a phone book (name → number)
+- `merges.txt` = the rules for how to spell/combine names before looking them up
+
+Senior one-liner:
+`vocab.json` defines the token-to-ID mapping and `merges.txt` defines the ordered merge operations that deterministically convert raw text into those tokens — both are required to reproduce identical tokenization across training and inference.
+
+### Q20. How does merges.txt look in code, and how are the rules defined?
+
+You don't write `merges.txt` manually — it's automatically generated by the BPE training algorithm.
+
+The BPE training algorithm (simplified Python):
+```python
+from collections import Counter
+
+# Step 1: Start with character-level splits of your corpus
+corpus = {
+    ('l', 'o', 'w'): 5,            # "low" appears 5 times
+    ('l', 'o', 'w', 'e', 'r'): 2,  # "lower" appears 2 times
+    ('n', 'e', 'w'): 6,            # "new" appears 6 times
+    ('n', 'e', 'w', 'e', 'r'): 3,  # "newer" appears 3 times
+}
+
+merges = []  # This becomes merges.txt
+
+for i in range(num_merges):  # e.g., 10000 iterations
+    # Step 2: Count all adjacent pairs across corpus
+    pair_counts = Counter()
+    for word, freq in corpus.items():
+        for j in range(len(word) - 1):
+            pair = (word[j], word[j+1])
+            pair_counts[pair] += freq
+
+    # Step 3: Find the most frequent pair
+    best_pair = pair_counts.most_common(1)[0][0]
+    # e.g., ('n', 'e') with count 9 (6 from "new" + 3 from "newer")
+
+    # Step 4: Record this merge rule
+    merges.append(best_pair)
+    # merges.txt gets: "n e"
+
+    # Step 5: Apply merge — replace all occurrences in corpus
+    new_corpus = {}
+    for word, freq in corpus.items():
+        new_word = merge_pair(word, best_pair)  # ('n','e','w') → ('ne','w')
+        new_corpus[new_word] = freq
+    corpus = new_corpus
+
+# Step 6: Save
+# merges.txt = ordered list of merge rules
+# vocab.json = all unique tokens seen after all merges + base chars
+```
+
+What merges.txt actually looks like (real file from GPT-2):
+```
+#version: 0.2
+Ġ t
+Ġ a
+h e
+i n
+r e
+o n
+Ġt he
+e r
+Ġ s
+a t
+...
+(~50,000 lines total)
+```
+Each line = one merge rule: `"token_A token_B"` means "merge A+B into AB".
+Rules are in priority order — line 1 is applied before line 2, etc.
+
+How rules are applied at tokenization time:
+```python
+# Input word: "newer"
+tokens = ['n', 'e', 'w', 'e', 'r']
+
+# Apply merges in order:
+# Rule 1: "n e" → merge
+tokens = ['ne', 'w', 'e', 'r']
+# Rule 5: "e r" → merge
+tokens = ['ne', 'w', 'er']
+# Rule 42: "ne w" → merge (if exists)
+tokens = ['new', 'er']
+# Rule 89: "new er" → merge (if exists)
+tokens = ['newer']
+# Stop when no more applicable rules
+```
+
+Using HuggingFace tokenizers library (production way):
+```python
+from tokenizers import Tokenizer
+from tokenizers.models import BPE
+from tokenizers.trainers import BpeTrainer
+from tokenizers.pre_tokenizers import Whitespace
+
+tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
+tokenizer.pre_tokenizer = Whitespace()
+
+trainer = BpeTrainer(
+    vocab_size=50000,
+    min_frequency=2,
+    special_tokens=["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
+)
+
+# Train on corpus — generates vocab + merges automatically
+tokenizer.train(files=["corpus.txt"], trainer=trainer)
+tokenizer.save("my_tokenizer.json")
+```
+
+Key summary:
+
+| What | How |
+|---|---|
+| Who writes merges.txt? | The BPE training algorithm, not humans |
+| What decides the rules? | Frequency — most common adjacent pairs get merged first |
+| How many rules? | `vocab_size - base_characters` (e.g., 50000 - 256 ≈ 49744 rules) |
+| Order matters? | Yes — earlier rules = higher frequency = applied first |
+| When is it frozen? | After training — never changes during model training or inference |
+
+Interview-ready summary:
+`merges.txt` is the ordered output of BPE's greedy frequency-based pair-merging algorithm — each rule says "combine these two tokens into one," applied in strict priority order during tokenization, and the entire file is generated once from the training corpus then frozen for the model's lifetime.
+
+Key points for interview:
+1. Vocabulary is corpus-derived — frequent patterns get their own token; rare ones stay split.
+2. Size is fixed before training — once built, it never changes during training or inference.
+3. Frequency-driven — "the" is one token, but "neurological" might be `["neur", "olog", "ical"]` because it's rarer.
+4. Covers everything — even unseen text is representable via subword fallback to characters/bytes.
+
+Interview-ready summary:
+A vocabulary is a fixed-size frequency-optimized mapping from subword strings to integer IDs, built once from the training corpus, where common patterns get dedicated entries and rare text decomposes into smaller known pieces — ensuring full coverage without infinite size.
 
 ---
 

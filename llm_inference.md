@@ -581,6 +581,121 @@ If logits behave like negative energies:
 
 ---
 
+## Q7.1: What weights are active in the dropout layer during inference when dropout is off?
+
+### Beginner Level: Simple Intuition
+
+During training, dropout randomly turns off some neurons. But the layer itself still has weights — dropout acts on **activations** (outputs of neurons), not on the weights themselves.
+
+During inference (dropout off):
+- The layer is **fully active**.
+- All neurons participate.
+- The **exact same learned weights** are used — nothing is removed or deactivated.
+
+So the question "is that layer active or inactive?" — the answer is: **always active, with all its weights intact**.
+
+---
+
+### Intermediate Level: The Inverted Dropout Scaling Trick
+
+The real question is: if only 50% of neurons fired during training, but 100% fire during inference, won't the signal be **twice as strong**?
+
+Yes — and that's why modern frameworks use **inverted dropout**.
+
+#### How inverted dropout works (PyTorch default):
+
+During **training** with dropout rate $p = 0.5$:
+
+```
+Input activations:  [0.8, 1.2, 0.5, 0.9]
+Random mask:        [1,   0,   1,   0  ]       ← 50% zeroed
+After mask:         [0.8, 0.0, 0.5, 0.0]
+Scale by 1/(1-p):   [1.6, 0.0, 1.0, 0.0]       ← survivors scaled up by 2x
+```
+
+During **inference**:
+
+```
+Input activations:  [0.8, 1.2, 0.5, 0.9]       ← all pass through unchanged
+```
+
+**Why this works:** The scaling during training ensures that the expected magnitude of activations is the same in both modes.
+
+$$E[\tilde{h}_i] = (1-p) \cdot \frac{h_i}{1-p} + p \cdot 0 = h_i$$
+
+So at inference, when all neurons fire with value $h_i$, the downstream layers see exactly the magnitude they were trained to expect.
+
+---
+
+### Senior Level: Weight Perspective and Mathematical Proof
+
+#### Key clarification: Dropout does NOT touch weights
+
+```
+Layer computation: output = W × input + bias
+Dropout applied:  output_dropped = dropout_mask × output
+```
+
+The weight matrix $W$ is never modified by dropout. Dropout is a **post-activation operation** — it masks the output of a layer before it reaches the next layer.
+
+#### Why the layer must be active at inference:
+
+The weights $W$ encode learned features. Every column of $W$ represents a learned pattern detector. Deactivating the layer would mean losing all those learned representations. The model needs ALL of them to produce correct output.
+
+#### The two historical approaches:
+
+| Approach | Training | Inference |
+|----------|----------|-----------|
+| **Classical dropout** | Mask activations, no scaling | Multiply weights by $(1-p)$ |
+| **Inverted dropout** (modern) | Mask activations, scale survivors by $\frac{1}{1-p}$ | Use weights as-is, no modification |
+
+Both achieve the same mathematical result: **expected activation magnitude is identical in train and inference modes.**
+
+#### PyTorch implementation (what actually runs):
+
+```python
+class Dropout(nn.Module):
+    def forward(self, x):
+        if self.training:
+            mask = torch.bernoulli(torch.ones_like(x) * (1 - self.p))
+            return x * mask / (1 - self.p)   # scale up survivors
+        else:
+            return x  # pass through unchanged — same weights, all active
+```
+
+#### What would break without scaling:
+
+- Training: next layer adapts to receiving ~50% of total signal magnitude.
+- Inference without compensation: suddenly 100% signal → activations 2x larger → softmax becomes overconfident → model outputs degrade.
+
+#### Numeric proof:
+
+Layer with 4 neurons, dropout $p = 0.5$:
+
+| | Training (with inverted dropout) | Inference |
+|--|--|--|
+| Active neurons | ~2 out of 4 | 4 out of 4 |
+| Each survivor's output | $h_i \times \frac{1}{0.5} = 2h_i$ | $h_i$ |
+| Expected sum | $2 \times 2h_i = 4h_i$ (on average) | $4 \times h_i = 4h_i$ |
+
+Both modes produce the same expected total signal → downstream layers behave consistently.
+
+---
+
+### Interview-Ready Summary
+
+| Question | Answer |
+|----------|--------|
+| Is the dropout layer active during inference? | **Yes, always fully active** |
+| What weights are used? | **Exact same learned weights — unchanged** |
+| How is magnitude mismatch avoided? | **Inverted dropout scales survivors by $\frac{1}{1-p}$ during training** |
+| Does the model "skip" anything at inference? | **No — `model.eval()` simply tells dropout to stop masking, not to deactivate** |
+| Where does dropout act? | **On activations (layer outputs), never on weights directly** |
+
+**One-line senior answer:** Dropout layers are always active during inference with unchanged weights; the train-inference magnitude consistency is guaranteed by inverted dropout's $\frac{1}{1-p}$ scaling applied during training, making no adjustment necessary at inference time.
+
+---
+
 ## Q8: What is KV cache in LLM inference?
 
 ### Beginner Level: Simple Intuition

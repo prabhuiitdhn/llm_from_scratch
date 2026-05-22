@@ -144,7 +144,10 @@ With a linear function like $\frac{z_i}{\sum_j z_j}$:
 #### Exponential as temperature scaling:
 
 The softmax can be generalized with a temperature parameter:
-$$\text{softmax}_T(z_i) = \frac{e^{z_i/T}}{\sum_{j} e^{z_j/T}}$$
+
+$$
+\text{softmax}\_{T}(z\_{i}) = \frac{e^{z\_{i}/T}}{\sum\_{j} e^{z\_{j}/T}}
+$$
 
 - **Low temperature** (T → 0): Exponential amplifies even more → one-hot-like (sharp decision)
 - **High temperature** (T → ∞): More uniform distribution (softer probabilities)

@@ -852,7 +852,10 @@ With CoW:
 - On divergence, the system allocates a new page and copies only that page.
 
 Memory saving:
-$$\text{Saved memory} \approx (\text{num\_requests} - 1) \times \text{prefix\_length} \times \text{KV\_size\_per\_token}$$
+
+$$
+\text{Saved memory} \approx (\text{num\\_requests} - 1) \times \text{prefix\\_length} \times \text{KV\\_size\\_per\\_token}
+$$
 
 This is why prefix caching and CoW together are critical for high-throughput LLM serving with shared prompts.
 

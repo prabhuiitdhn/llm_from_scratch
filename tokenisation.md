@@ -263,9 +263,14 @@ Sequence truncation rate:
 - Truncation can remove important instructions, evidence, or output targets, causing silent quality degradation.
 
 Useful formulas:
-$\text{UNK Rate} = \frac{\#\text{UNK tokens}}{\#\text{total tokens}}$
 
-$\text{Truncation Rate} = \frac{\#\text{truncated samples}}{\#\text{total samples}}$
+$$
+\text{UNK Rate} = \frac{\text{\\#UNK tokens}}{\text{\\#total tokens}}
+$$
+
+$$
+\text{Truncation Rate} = \frac{\text{\\#truncated samples}}{\text{\\#total samples}}
+$$
 
 Senior-level interpretation:
 - UNK rate is a representation-quality signal.

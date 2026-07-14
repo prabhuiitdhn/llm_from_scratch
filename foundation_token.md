@@ -201,6 +201,176 @@ Tokenisation is conversion of text into token IDs for model processing. It matte
 
 Because using validation or test data during tokenizer fitting introduces leakage. This can inflate evaluation quality and hide real-world generalization issues.
 
+**Detailed Explanation:**
+
+**The Core Issue: Data Leakage**
+
+When you fit a tokenizer (build its vocabulary) on validation or test data, you're allowing information from those datasets to influence how text gets converted to tokens. This creates a subtle but severe form of **data leakage**.
+
+**Why This Matters: Step-by-Step**
+
+Scenario 1: The Problem (Incorrect Approach)
+```
+Training data:    ["cat", "dog", "bird"]
+Validation data:  ["elephant", "giraffe", "zebra"]
+Test data:        ["tiger", "lion", "bear"]
+
+❌ WRONG: Fit tokenizer on ALL three sets
+  Vocabulary built: {cat, dog, bird, elephant, giraffe, zebra, tiger, lion, bear}
+  
+Problem:
+  - Validation sees specialized tokens for "elephant", "giraffe", "zebra"
+  - These tokens only exist BECAUSE validation data was used
+  - Model learns to rely on these dedicated tokens
+  - At test time, if "elephant" appears differently (or similar unseen animal),
+    the model fails because it never learned to handle that pattern
+  - Your validation/test metrics are artificially inflated
+```
+
+Scenario 2: The Correct Approach
+```
+Training data:    ["cat", "dog", "bird"]
+Validation data:  ["elephant", "giraffe", "zebra"]
+Test data:        ["tiger", "lion", "bear"]
+
+✓ CORRECT: Fit tokenizer on TRAINING data only
+  Vocabulary built: {cat, dog, bird, <unk>}
+  
+What happens:
+  - During validation: "elephant" → splits into subwords or <unk>
+    Model must handle unseen words
+  - During testing: "tiger" → splits into subwords or <unk>
+    Model must generalize
+  - Model learned to work with token patterns from training
+  - Validation and test metrics reflect REAL generalization
+```
+
+**The Leakage Mechanism (Why It's Silent & Dangerous)**
+
+1. **Vocabulary Bias**: If you use validation data to build vocab, rare or domain-specific words in validation get their own tokens
+   - Example: If validation has many medical terms, they get vocabulary entries
+   - Training never saw these patterns during optimization
+   - Model metrics look good in validation, but fail on real data with different vocabulary distribution
+
+2. **Statistical Mismatch**: The model's weights are optimized for the training token distribution
+   - If validation tokens don't exist in that distribution, metrics are artificially high
+   - Real inference has different token patterns → performance drops
+
+3. **Information Seepage**: Even subtle biases compound
+   - Tokenizer fitting on all data means validation data slightly influences token ID assignments
+   - Token IDs affect embeddings, which affects all downstream computation
+   - This bias is never caught during evaluation
+
+**Concrete Example: Why Metrics Become Misleading**
+
+Domain Shift Scenario:
+```
+Training corpus: General English Wikipedia
+  Vocab built from: Common words, BPE merges on frequent patterns
+  Vocabulary: 50K tokens optimized for general text
+
+Validation + Test corpus: Medical research papers
+  Medical terms: "carcinoma", "metastasis", "biopsy", "hemoglobin"
+
+❌ IF you fit tokenizer on all data:
+  Vocabulary: 50K tokens INCLUDING dedicated medical tokens
+  Validation accuracy: 94% (model sees dedicated tokens for medical terms)
+  Test accuracy: 94% (test also has medical tokens)
+  
+  Reality check: Deploy to general English → accuracy drops to 72%
+  Why? The model optimized for those dedicated medical tokens in validation,
+  but never learned robust representations in training
+
+✓ IF you fit tokenizer on training only:
+  Vocabulary: 50K tokens from Wikipedia (general English)
+  During validation: Medical words → broken into subwords or <unk>
+  Validation accuracy: 78% (model struggles, as expected)
+  Test accuracy: 79% (consistent struggle)
+  
+  Reality check: Deploy to general English → accuracy stays ~80%
+  Why? Metrics were honest. Model learned robust general patterns.
+```
+
+**The Compounding Effect (Multi-Token Problem)**
+
+With subword tokenization, the effect scales:
+```
+Word: "carcinoma" (unseen in training, present in validation data used for vocab fitting)
+
+❌ If vocab includes this word:
+  "carcinoma" → [token_ID: 31045]  (single dedicated token)
+  Model learns an embedding for this specific token during training?
+    → NO! It never saw this token in training
+    → Embedding initialized randomly
+    → Validation metrics fool you into thinking model understands this word
+
+✓ If vocab does NOT include this word (training-only fitting):
+  "carcinoma" → [token_IDs: 12034, 5019, 8892]  (broken into subword pieces)
+  Model learns embeddings for these subword pieces during training
+  When it sees "carcinoma" in validation, it composes understanding from known pieces
+  Metrics are honest: lower, but representative of real generalization
+```
+
+**Why It's Hard to Detect**
+
+This leakage is **silent** because:
+1. No error messages
+2. Metrics look good in validation
+3. Only appears later in production or on truly held-out data
+4. The bias is encoded in the tokenizer, not the model weights themselves
+
+**The Fix: Three Separate Tokenization Paths (Best Practice)**
+
+```python
+# CORRECT workflow:
+
+# 1. Build vocabulary from training data ONLY
+tokenizer = BasicTokenizer()
+tokenizer.fit(training_texts)  # ← ONLY training
+
+# 2. Encode validation with the same tokenizer
+validation_encoded = tokenizer.encode(validation_texts)
+
+# 3. Encode test with the same tokenizer
+test_encoded = tokenizer.encode(test_texts)
+
+# Result: 
+#   - Same vocabulary across all three splits
+#   - No data from validation/test influenced the vocabulary
+#   - If validation/test have unseen words → they map to <unk> or subwords
+#   - Metrics reflect true generalization
+```
+
+**Why This Parallels Train/Test Split Philosophy**
+
+General ML principle:
+  Train/validation/test MUST be separate
+  → Prevents overfitting to validation selection
+
+Tokenizer fitting principle:
+  Vocabulary is built from training data ONLY
+  → Prevents leakage into token distribution
+  → Ensures consistent encoding across splits
+  → Metrics reflect real-world token patterns the model will encounter
+
+**Senior-Level Interpretation**
+
+At scale, tokenizer fitting is a **statistical decision** encoded in the preprocessing layer:
+
+- **Training tokenizer fit on ALL data**: You're saying "assume validation/test tokens are representative of production. This is wrong."
+- **Training tokenizer fit on training data only**: You're saying "production data will have unseen patterns. Validation/test should measure how model handles that."
+
+The second is correct because **real production always has distributional shift** compared to training.
+
+| Aspect | Train-Only Fitting | All-Data Fitting |
+|--------|---|---|
+| Leakage risk | None | High |
+| Validation metrics | Honest, conservative | Inflated, optimistic |
+| Unseen words handled by | Model's learned subword patterns | Dedicated vocabulary entries |
+| Production performance | Matches validation closely | Degrades significantly |
+| Token distribution match | Train ↔ Val ↔ Test aligned | Train misaligned from Val/Test |
+| Debug difficulty | Easy to spot drift | Silent failures |
+
 ### Q3. What breaks if training and inference use different tokenizer versions?
 
 The model receives different token ID patterns than it learned during training, which can degrade instruction following, retrieval grounding, formatting compliance, and overall quality.

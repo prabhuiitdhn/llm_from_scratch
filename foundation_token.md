@@ -387,6 +387,216 @@ Without attention masks, models may attend to padding tokens as if they were rea
 
 A robust policy preserves the most important information for the task, tracks truncation rate as a metric, and is aligned between training and inference. It should be explicit, not accidental.
 
+**Detailed Explanation:**
+
+**What Truncation Is & Why It Matters**
+
+Truncation is cutting off text when it exceeds your maximum sequence length. Unlike padding (which adds filler tokens), truncation permanently removes information. This is a lossy operation—once text is truncated, the model never sees what was cut off.
+
+Example:
+```
+Original text (200 tokens):
+"The patient presented with chest pain on Monday. 
+The doctor ran tests and found... [important diagnosis info] ... 
+Treatment plan includes..."
+
+With max_length=128:
+Truncated to: "The patient presented with chest pain on Monday. 
+The doctor ran tests and found..."
+
+What the model never sees:
+"...important diagnosis info... Treatment plan includes..."
+
+Result: Critical medical information is lost silently.
+```
+
+**What Makes a Policy "Robust"?**
+
+A robust truncation policy has three core properties:
+
+1. **Task-Aware Preservation**: Truncate in a way that keeps the most task-critical information
+   - Classification: Keep the main content, truncate metadata/timestamps
+   - QA: Keep the question and evidence paragraphs, truncate distractors
+   - Summarization: Keep full text as much as possible, cut only if forced
+   - Chat: Keep recent user message and assistant context, truncate old history
+
+2. **Tracking & Visibility**: Monitor truncation as a metric
+   - What % of samples get truncated?
+   - How much text is being lost on average?
+   - Does truncation rate vary by data slice (language, user segment, prompt type)?
+
+3. **Train-Inference Alignment**: Same truncation rule everywhere
+   - If training truncates from the **end** of text, inference must too
+   - If training keeps the **first 90% + last 10%**, inference must match
+   - Mismatch between train and inference creates distribution shift
+
+**Why "Explicit, Not Accidental" Matters**
+
+Accidental truncation:
+```python
+# ❌ BAD: Implicit truncation (accidental, not tracked)
+text = "very long text..."
+encoded = tokenizer(text)  # Quietly truncates if too long
+# You don't know how much was cut or if it matters
+# Different backends may truncate differently
+```
+
+Explicit truncation:
+```python
+# ✓ GOOD: Explicit policy (intentional, tracked, reproducible)
+def truncate_for_task(text, max_length, strategy="preserve_end"):
+    """
+    Truncate text with a known strategy.
+    
+    Args:
+        strategy: "preserve_end" (keep conclusion)
+                  "preserve_start" (keep context)
+                  "preserve_middle" (keep key section)
+    """
+    tokens = tokenizer.encode(text)
+    
+    if len(tokens) <= max_length:
+        return tokens, False  # Not truncated
+    
+    truncated_tokens = truncate_strategy(tokens, max_length, strategy)
+    return truncated_tokens, True  # Was truncated
+```
+
+**Concrete Example: Instruction Tuning**
+
+```
+Input: [INST] Summarize this article: {article_text} [/INST]
+
+Article is 5000 tokens. Max sequence length = 2048.
+
+❌ BAD truncation policy:
+  - Just cut it off at 2048
+  - Lose the conclusion/summary targets
+  - Model can't learn what you want
+
+✓ GOOD truncation policy:
+  - Reserve tokens: [INST] + instruction = 50 tokens
+  - Reserved for [/INST] + response = 256 tokens
+  - Available for article: 2048 - 50 - 256 = 1742 tokens
+  - Truncate article to 1742, preserving first paragraphs
+  - Rationale: Article beginning typically has key context
+```
+
+**Why Silent Truncation Is Dangerous**
+
+```
+Training phase:
+- Sample: "User query: [50 tokens] | Context: [1000 tokens]"
+- After truncation: "User query: [50 tokens] | Context: [950 tokens]"
+- Truncation rate: 5% (tracked? usually no)
+- Model learns with truncated context
+
+Inference phase:
+- Same user query: [50 tokens] | Same context: [1000 tokens]
+- If truncation policy differs or isn't tracked:
+  - Different backend might cut at [900 tokens]
+  - Or context might be preserved fully
+  - Model receives different distribution than training
+  - Quality drops mysteriously
+
+Root cause: Truncation was implicit/accidental
+```
+
+**How to Implement a Robust Policy**
+
+```python
+class RobustTruncationPolicy:
+    def __init__(self, max_length, strategy="preserve_important"):
+        self.max_length = max_length
+        self.strategy = strategy
+        self.truncation_stats = {"total": 0, "truncated": 0}
+    
+    def truncate(self, tokens, task_type="general"):
+        """Apply task-aware truncation with explicit tracking."""
+        
+        # Track baseline
+        original_length = len(tokens)
+        self.truncation_stats["total"] += 1
+        
+        if len(tokens) <= self.max_length:
+            return tokens, False  # Not truncated
+        
+        # Apply strategy
+        if task_type == "qa":
+            # For QA: preserve question (first part)
+            truncated = self._preserve_question(tokens)
+        elif task_type == "summarization":
+            # For summarization: preserve document start
+            truncated = self._preserve_start(tokens)
+        else:
+            # Default: preserve end (often has conclusion)
+            truncated = self._preserve_end(tokens)
+        
+        self.truncation_stats["truncated"] += 1
+        loss_pct = (1 - len(truncated) / original_length) * 100
+        
+        # Log for monitoring
+        print(f"Truncated: {original_length} → {len(truncated)} ({loss_pct:.1f}% loss)")
+        
+        return truncated, True
+    
+    def _preserve_end(self, tokens):
+        """Keep last N tokens (conclusion/summary)."""
+        return tokens[-self.max_length:]
+    
+    def _preserve_start(self, tokens):
+        """Keep first N tokens (context/setup)."""
+        return tokens[:self.max_length]
+    
+    def truncation_rate(self):
+        """Return % of samples that were truncated."""
+        if self.truncation_stats["total"] == 0:
+            return 0
+        return (self.truncation_stats["truncated"] / 
+                self.truncation_stats["total"]) * 100
+
+# Usage
+policy = RobustTruncationPolicy(max_length=2048, strategy="preserve_important")
+
+# Training
+for batch in training_data:
+    for text in batch:
+        tokens = tokenizer.encode(text)
+        truncated_tokens, was_truncated = policy.truncate(tokens, task_type="qa")
+        # Train on truncated_tokens
+
+# Inference
+same_policy = RobustTruncationPolicy(max_length=2048, strategy="preserve_important")
+for user_input in inference_data:
+    tokens = tokenizer.encode(user_input)
+    truncated_tokens, was_truncated = same_policy.truncate(tokens, task_type="qa")
+    # Inference with truncated_tokens (same policy!)
+
+# Monitoring
+print(f"Truncation rate in production: {same_policy.truncation_rate():.2f}%")
+```
+
+**Red Flags (What NOT to Do)**
+
+| Anti-Pattern | Why It's Bad |
+|---|---|
+| Truncate without tracking | Don't know if it's a problem |
+| Different truncation in train vs. inference | Distribution shift → quality drop |
+| Truncate randomly from middle | Lose both context and conclusion |
+| Assume model handles truncation gracefully | Silently fails on real data |
+| Don't version truncation policy | Debugging becomes impossible |
+| Ignore truncation rate growth | Can creep up as data changes |
+
+**Senior-Level Insight**
+
+Truncation is a **compression constraint encoded in preprocessing**—not a model design choice. A robust policy treats it as:
+- A first-class metric (tracked, monitored, versioned)
+- Task-aware (not one-size-fits-all)
+- Deterministic (reproducible across train/val/inference)
+- Documented (why this strategy, why this max_length)
+
+The policy becomes part of your model's **input contract**—just like vocabulary or normalization. Breaking the contract (different truncation rules) breaks the model.
+
 ### Q7. How do you evaluate tokenization quality in a production NLP pipeline?
 
 Track token length distributions, truncation rates, OOV/UNK rates (if relevant), task metrics by length bucket, and failure modes caused by malformed or multilingual inputs. Combine these with human review on edge cases.

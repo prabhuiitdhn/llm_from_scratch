@@ -1030,3 +1030,331 @@ A vocabulary is a fixed-size frequency-optimized mapping from subword strings to
 - Keep tokenizer consistent across training, validation, and inference.
 - Subword tokenization improves robustness in real-world inputs.
 - Senior engineers monitor tokenization metrics in production.
+
+---
+
+## 9. Transformer Architecture Q&A (Encoder vs Decoder)
+
+### Q21. What is the difference between encoder-only and decoder-only transformer?
+
+**Beginner Understanding:**
+
+Encoder-only and decoder-only are two different transformer architecture designs for different tasks.
+
+| Aspect | Encoder-Only | Decoder-Only |
+|--------|---|---|
+| **Attention** | Bidirectional (sees all tokens) | Causal (left-to-right only) |
+| **Primary Task** | Understanding/classification | Generation/next-token prediction |
+| **Examples** | BERT, RoBERTa, ELECTRA | GPT-2, GPT-3, Llama, Llama-2 |
+| **Training Method** | Masked language modeling (MLM) | Causal language modeling (CLM) |
+| **Input** | Full context available at once | Tokens generated left-to-right |
+
+**Intermediate Understanding:**
+
+Encoder-only (bidirectional):
+- All positions can attend to all other positions (past, present, future)
+- Training task: "The cat sat on the [MASK]" → predict the masked word using full context
+- Use cases: classification, semantic search, NER, QA (retrieve answer from passage)
+- Advantage: Rich contextual understanding from both directions
+- Drawback: Cannot generate text (doesn't know how to produce left-to-right sequences)
+
+Decoder-only (causal):
+- Each position can only attend to previous positions (left-to-right)
+- Training task: "The cat sat on the" → predict "mat", then "The cat sat on the mat" → predict next token
+- Use cases: text generation, instruction tuning, chat, code generation
+- Advantage: Naturally supports autoregressive generation (inference matches training)
+- Drawback: Cannot "see ahead" even though full context is available at training time
+
+**Senior-Level Interview Answer:**
+
+Encoder-only vs decoder-only is a **fundamental design tradeoff** rooted in the task objective and inference constraint.
+
+Encoder-only (BERT):
+- Training: Bidirectional attention enables full context optimization—efficient (15% of tokens masked, one forward pass predicts them all)
+- Inference: No autoregressive generation needed; suitable for classification/ranking/retrieval tasks
+- Architecture: Pure transformer encoder stack, position-dependent but not causally-masked
+
+Decoder-only (GPT):
+- Training: Causal masking applied even though full sequence exists, ensuring training distribution matches inference
+- Inference: Tokens generated one-at-a-time with autoregressive sampling; each token consumes only prior context
+- Architecture: Pure transformer decoder stack with causal self-attention and language modeling head
+
+The key insight: **Causal masking during training is NOT a limitation but a requirement** for decoder-only models. It prevents exposure bias (train-inference distribution mismatch) where training used unrealistic full context but inference only has partial context.
+
+Encoder-decoder hybrid (T5, BART) uses both: encoder processes full input bidirectionally, decoder generates output token-by-token with causal masking. Best of both worlds at 2x parameter cost.
+
+### Q22. What is causal masking in decoder-only architecture?
+
+**Beginner Understanding:**
+
+Causal masking is a technique that **prevents the model from looking at future tokens** when processing the current position. It ensures the model can only see past tokens (left-to-right), simulating how generation works.
+
+Example:
+```
+Sequence: "I love NLP"
+Position:  0 1   2 3
+
+Position 0 ("I"):    can see [0]              (only itself)
+Position 1 ("love"): can see [0, 1]           (past + self)
+Position 2 ("NLP"):  can see [0, 1, 2]        (all past + self)
+
+With causal masking, position 1 cannot see position 2.
+Without it (bidirectional), position 1 could peek at "NLP" (cheating).
+```
+
+**Intermediate Understanding:**
+
+Causal masking is implemented as an **upper triangular attention mask**:
+
+```
+Query-Key attention matrix for seq_len=4:
+Position:  0  1  2  3
+         ┌──────────────┐
+    0    │ ✓  ✗  ✗  ✗  │  ← Query 0 can only attend to position 0
+    1    │ ✓  ✓  ✗  ✗  │  ← Query 1 can attend to positions 0,1
+    2    │ ✓  ✓  ✓  ✗  │  ← Query 2 can attend to positions 0,1,2
+    3    │ ✓  ✓  ✓  ✓  │  ← Query 3 can attend to all positions
+         └──────────────┘
+
+✓ = allowed to attend
+✗ = blocked (masked)
+```
+
+Implementation (PyTorch):
+```python
+# Create upper triangular boolean mask (True = blocked)
+mask = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1)
+
+# Apply to attention scores
+scores = torch.matmul(q, k.transpose(-2, -1)) / sqrt(d_head)
+scores = scores.masked_fill(mask.unsqueeze(0).unsqueeze(0), -1e9)
+# Positions marked as True get -1e9 → softmax(-1e9) ≈ 0 weight
+
+weights = F.softmax(scores, dim=-1)  # Future tokens get ~0 attention
+```
+
+**Senior-Level Interview Answer:**
+
+Causal masking is a **training-inference alignment mechanism**. Without it, decoder-only models exhibit severe exposure bias.
+
+Why it's essential:
+
+Training vs inference mismatch (without causal masking):
+```
+Training (no causal mask, bidirectional):
+  Position 2 ("NLP") can attend to [0, 1, 2, 3, 4, 5, ...]
+  Model sees all future context — easy, unrealistic task
+  Learns to rely on lookahead information
+
+Inference (autoregressive generation):
+  Position 2 can only see [0, 1, 2] (previously generated tokens)
+  Positions 3+ don't exist yet
+  Model receives different context distribution → quality crashes
+```
+
+With causal masking:
+```
+Training (with causal mask, enforced left-to-right):
+  Position 2 can attend to [0, 1, 2] only
+  Matches inference-time context distribution
+  Gradients optimize for realistic left-to-right generation
+
+Inference:
+  Same causal-masked attention applied
+  No distribution mismatch — model performs as trained
+```
+
+Mechanically, causal masking works by:
+1. Computing full attention scores between all positions
+2. Setting future-position scores to -1e9 (large negative value)
+3. Softmax converts -1e9 → ≈0 weight
+4. Model effectively ignores future tokens (zero gradient contribution)
+
+Key insight for interviews:
+Causal masking is **not** a computational limitation or a convenience. It's a **correctness requirement** to ensure training reflects inference constraints. Removing it would train a fundamentally different distribution-matching task, causing catastrophic failure in production.
+
+| Aspect | With Causal Masking | Without Causal Masking |
+|--------|---|---|
+| Training context | Position i sees [0...i] | Position i sees [0...seq_len] |
+| Inference context | Position i sees [0...i] | Position i sees [0...i] |
+| Distribution match | ✓ Aligned | ✗ Misaligned |
+| Exposure bias risk | Low (training ≈ inference) | High (different tasks) |
+| Production quality | Stable | Degrades significantly |
+
+The fundamental principle: **Always train what you will deploy.** Causal masking ensures this principle by making training and inference use identical context distributions.
+
+### Q23. How does element-wise addition of position embeddings help in learning attention?
+
+**The Problem You're Identifying:**
+
+With concatenation, position embeddings form a **separate, structured signal**:
+
+```python
+# CONCATENATION (problematic)
+combined = [token_emb, pos_emb]  # Shape: [batch, seq, 2*d_model]
+                 ↑        ↑
+            random      highly structured
+           (semantic)   (sequential 0,1,2,3...)
+
+Problem:
+- Position channel is predictable/deterministic
+- Token channel is random (learned from data)
+- Attention could "cheat" by learning to rank based on position structure
+- Position info dominates because it's cleaner/more organized
+```
+
+With concatenation, the model could learn position shortcuts during attention:
+```
+Example attention ranking (bad):
+  Token at pos 0: rank = 0.3
+  Token at pos 1: rank = 0.5  ← Higher because position channel stronger
+  Token at pos 2: rank = 0.7  ← Even higher
+  
+Result: Ranking by position alone, ignoring semantic similarity
+```
+
+**Why Addition Solves This:**
+
+With addition, the two signals are **fused together**:
+
+```python
+# ADDITION (correct)
+combined = token_emb + pos_emb  # Shape: [batch, seq, d_model]
+              ↑          ↑
+          random    structured
+          mixed into one representation
+
+Result:
+- Position info is "hidden" inside the combined vector
+- Model must learn to disentangle both signals
+- Can't just rank by position alone
+- Forces proper semantic + positional reasoning
+```
+
+**Example of embedding fusion:**
+```
+Token emb for token 10:   [0.5, 0.2, -0.1, 0.3, 0.1, -0.4, 0.2, 0.0]
+Position emb for pos 0:   [0.1, -0.2, 0.3, -0.1, 0.2, 0.0, -0.3, 0.1]
+Combined (addition):      [0.6, 0.0, 0.2, 0.2, 0.3, -0.4, -0.1, 0.1]
+                           ↑
+                     Can't separate them!
+                     Requires learning their interaction
+```
+
+**Why Addition Forces Better Attention Learning:**
+
+During forward pass:
+```python
+# Token 10 at position 0:
+combined_emb = token_emb + pos_emb  # Blended signal
+
+# Attention computation uses this blended representation
+q = linear_q(combined_emb)
+k_other = linear_k(other_combined_emb)
+scores = q @ k_other.T  # Must account for BOTH semantics AND position
+
+# Attention learns: "Attend more to semantically similar tokens 
+#                    that are nearby (not too far away)"
+```
+
+During backward pass (gradient flow):
+```
+Loss gradient flows back through:
+  1. Attention weights
+  2. Combined embedding
+  3. Both token_emb AND pos_emb simultaneously
+
+The model learns:
+- How much position contributes to this attention decision
+- How much token semantics contribute
+- They're learned together as an inseparable team
+- Can't optimize one while ignoring the other
+```
+
+**Concrete Ranking Behavior Comparison:**
+
+With concatenation (problematic):
+```
+Query at position 2:
+  combined = [token_feat_1, ..., token_feat_4, pos_feat_1, ..., pos_feat_4]
+                         token part               position part
+
+Attention scores:
+  Token 1 at pos 0: high_token_sim + low_pos_penalty  = 0.5
+  Token 2 at pos 1: low_token_sim  + low_pos_penalty  = 0.3  ← Position bonus!
+  Token 3 at pos 2: mid_token_sim  + zero_pos_penalty = 0.5
+  Token 4 at pos 3: high_token_sim + high_pos_penalty = 0.2
+
+Result: Position 2 and 0 tie, even though pos 0 semantically different
+Problem: Position structure too visible, enables ranking shortcuts
+```
+
+With addition (correct):
+```
+Query at position 2:
+  combined = [0.6, 0.0, 0.2, 0.2, 0.3, ...]  ← Mixed signal, can't separate
+
+Attention scores:
+  Token 1 at pos 0: 0.4  (semantically similar, but far)
+  Token 2 at pos 1: 0.2  (not similar, close)
+  Token 3 at pos 2: 0.8  (semantically similar, AND local context)
+  Token 4 at pos 3: 0.3  (not similar, close)
+
+Result: Position 2 wins clearly because semantic + positional signals align
+Learning: "Position 2 is semantically similar AND nearby — worth attending"
+Benefit: Must use both signals, can't shortcut via position alone
+```
+
+**Why This Matters for Attention Learning:**
+
+| Aspect | Concatenation | Addition |
+|--------|---|---|
+| **Position signal visibility** | Separate, clean channel | Fused, implicit |
+| **Attention ranking risk** | Can rank by position alone | Must use both signals |
+| **Gradient distribution** | Pos and token gradients separate | Gradients mix and interact |
+| **Learned patterns** | May learn position shortcuts | Learns true semantic+positional reasoning |
+| **Generalization** | Can overfit to position patterns | More robust to position shifts |
+
+**Code Example: Attention Learning with Addition**
+
+```python
+# ADDITION (correct learning)
+token_emb = torch.tensor([0.5, 0.2, -0.1, 0.3])
+pos_emb = torch.tensor([0.1, -0.2, 0.3, -0.1])
+
+combined = token_emb + pos_emb  # [0.6, 0.0, 0.2, 0.2]
+
+# During attention:
+q = W_q @ combined  # Linear projection mixes both signals
+k = W_k @ other_combined
+
+# Backprop:
+loss.backward()
+# Gradients flow to BOTH token_emb and pos_emb
+# They're optimized together as an inseparable team
+# Neither can dominate the ranking independently
+
+---
+
+# CONCATENATION (ranking problem)
+combined = torch.cat([token_emb, pos_emb])  # [0.5, 0.2, -0.1, 0.3, 0.1, -0.2, 0.3, -0.1]
+
+# During attention:
+q = W_q @ combined  # W_q has separate "position detector" rows
+                    # Could learn to use pos features directly for ranking
+
+# The model might learn:
+# "If pos feature 5 is high → rank high"  (BAD, position shortcut)
+# Instead of:
+# "If semantic features + pos features align → rank high"  (GOOD)
+```
+
+**Key Insight:**
+
+Addition forces **entanglement** of signals → model can't separate or prioritize position artificially. It must learn their **true interaction**: how position constrains meaningful semantic relationships.
+
+Concatenation allows **separation** → attention could shortcut by learning position patterns directly, ignoring semantic signal.
+
+**Senior-Level Interview Answer:**
+
+Element-wise addition of position embeddings prevents the model from learning position-based ranking shortcuts in attention. By fusing token and position signals into a single vector (rather than concatenating them as separate channels), the model is forced to learn their interaction during gradient flow. This ensures attention weights reflect semantic similarity constrained by positional context, not position patterns alone. The mechanism is fundamental to why addition is preferred over concatenation in transformer architectures — it aligns the optimization objective with the desired learning outcome: position-aware semantic attention rather than position-dominant ranking.

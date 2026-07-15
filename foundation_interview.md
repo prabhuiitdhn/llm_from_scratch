@@ -605,3 +605,275 @@ Vision Transformer Applications
 ```
 
 > **Interview angle for vision+language profile:** Know DETR (detection), SAM (segmentation), and LLaVA/BLIP-2 (VLMs) deeply. These three cover the full spectrum an interviewer would probe for an image+text fusion researcher role.
+
+---
+
+## Cross-Attention for Multi-Modal (Video + Text) AI
+
+### Q. How does cross-attention work for multi-modal video and text AI?
+
+**Beginner Understanding:**
+
+Cross-attention is a mechanism that lets one modality (e.g., text) "look at" and learn from another modality (e.g., video frames). Unlike self-attention where tokens only attend to other tokens of the same modality, cross-attention creates bridges between different modalities.
+
+Example:
+```
+Video frames: [frame_0, frame_1, frame_2, ...]  (visual embeddings)
+Text query:  "What is happening?"  (text embeddings)
+
+Cross-attention:
+  Text query attends to video frames
+  → Text learns "which frames are relevant"
+  → Combines visual information into text representation
+  → Model understands video content through text question
+```
+
+**Intermediate Understanding:**
+
+Cross-attention has three components: Query (Q), Key (K), Value (V)
+
+```
+Self-attention (within one modality):
+  Q from text, K from text, V from text
+  → Text attends to text
+
+Cross-attention (between modalities):
+  Q from text, K from video, V from video
+  → Text queries attend to video keys/values
+  → Text learns which video regions are relevant
+```
+
+**Attention Score Computation:**
+```
+scores = (Q @ K.T) / sqrt(d_model)
+weights = softmax(scores)  # Attention weights
+output = weights @ V
+```
+
+In multi-modal:
+```
+Q shape: [batch, seq_len_text, d_model]
+K shape: [batch, num_frames, d_model]  ← Video
+V shape: [batch, num_frames, d_model]  ← Video
+
+scores shape: [batch, seq_len_text, num_frames]
+              ↑ Each text token gets weights over frames
+
+output shape: [batch, seq_len_text, d_model]
+              ↑ Each text token is enriched with video info
+```
+
+**Common Multi-Modal Architectures:**
+
+| Architecture | Flow | Use Case |
+|---|---|---|
+| **Video Captioning** | Video → Encoder → Cross-Attention ← Text Decoder | Generate text describing video |
+| **Visual QA** | Video → Encoder, Question → Cross-Attention | Answer questions about video |
+| **Video Retrieval** | Query text & Video → Cross-Attention alignment | Find videos matching text |
+| **Video Understanding** | Video frames → Cross-Attention ← Text prompts | Classify/segment with text guidance |
+
+**Concrete Example: Video Captioning**
+
+```
+Input: Video with frames [f0, f1, f2, f3]
+Task: Generate caption
+
+Architecture:
+  1. Video Encoder: Extract visual embeddings per frame
+     f0 → v_emb_0 [shape: d_model]
+     f1 → v_emb_1 [shape: d_model]
+     f2 → v_emb_2 [shape: d_model]
+     f3 → v_emb_3 [shape: d_model]
+  
+  2. Text Decoder (with cross-attention to video)
+     
+     Start with BOS token → text_emb
+     
+     FIRST DECODING STEP:
+       Query: text_emb = "BOS" embedding [d_model]
+       Key/Value: [v_emb_0, v_emb_1, v_emb_2, v_emb_3] (video)
+       
+       Attention scores:
+         score_0 = text_emb @ v_emb_0 / sqrt(d_model) = 0.3
+         score_1 = text_emb @ v_emb_1 / sqrt(d_model) = 0.5  ← Highest
+         score_2 = text_emb @ v_emb_2 / sqrt(d_model) = 0.1
+         score_3 = text_emb @ v_emb_3 / sqrt(d_model) = 0.1
+       
+       Attention weights (after softmax):
+         w_0 = 0.15,  w_1 = 0.35,  w_2 = 0.25,  w_3 = 0.25
+       
+       Output: enriched_emb = w_0*v_emb_0 + w_1*v_emb_1 + w_2*v_emb_2 + w_3*v_emb_3
+       
+       Interpretation: Model attended most to frame 1 (tennis player hitting ball)
+     
+     Then generate token: "A" (from enriched_emb + self-attention history)
+     
+     SECOND DECODING STEP:
+       Query: "A" token embedding (now enriched with video context)
+       Cross-attend to video again:
+       
+       Output: enriched_emb_2 (new video context)
+       Generate next token: "person"
+     
+     Continue until EOS token
+     
+  Result: "A person playing tennis"
+```
+
+**Senior-Level Technical Details:**
+
+**1. Multi-Head Cross-Attention**
+
+```python
+# Pseudo-code
+class CrossAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        self.W_q = nn.Linear(d_model, d_model)  # Query projection (from text)
+        self.W_k = nn.Linear(d_model, d_model)  # Key projection (from video)
+        self.W_v = nn.Linear(d_model, d_model)  # Value projection (from video)
+        self.num_heads = num_heads
+    
+    def forward(self, text_emb, video_emb):
+        # text_emb: [batch, seq_len_text, d_model]
+        # video_emb: [batch, num_frames, d_model]
+        
+        Q = self.W_q(text_emb)  # [batch, seq_len_text, d_model]
+        K = self.W_k(video_emb)  # [batch, num_frames, d_model]
+        V = self.W_v(video_emb)  # [batch, num_frames, d_model]
+        
+        # Split into multiple heads
+        Q = Q.view(batch, seq_len_text, num_heads, d_head).transpose(1, 2)
+        K = K.view(batch, num_frames, num_heads, d_head).transpose(1, 2)
+        V = V.view(batch, num_frames, num_heads, d_head).transpose(1, 2)
+        
+        # Compute attention per head
+        scores = Q @ K.transpose(-2, -1) / sqrt(d_head)
+        # Shape: [batch, num_heads, seq_len_text, num_frames]
+        
+        weights = softmax(scores, dim=-1)
+        output = weights @ V
+        # Shape: [batch, num_heads, seq_len_text, d_head]
+        
+        # Concatenate heads
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len_text, d_model)
+        return output
+```
+
+**2. Sequential vs Parallel Cross-Attention**
+
+Sequential (Decoder-style for generation):
+```
+Step 1: Generate token 1
+  - Cross-attend to all video frames
+  - Use previously generated tokens (self-attention)
+  - Decode token 1
+
+Step 2: Generate token 2
+  - Cross-attend to all video frames (same video)
+  - Use token 1 + previous history (self-attention)
+  - Decode token 2
+
+Risk: Compounding errors if early tokens are wrong
+```
+
+Parallel (Encoder-style, for understanding):
+```
+Process all video frames + entire text together:
+  - All text tokens cross-attend to all video frames simultaneously
+  - Symmetric bidirectional alignment
+  - Better for retrieval/matching tasks
+
+Advantage: No error accumulation, captures full alignment
+```
+
+**3. Video Representation Strategies**
+
+```
+Strategy 1: Frame-level cross-attention
+  Video: [frame_0, frame_1, frame_2, ...]  (each ~2D image)
+  Query: text tokens
+  
+  Problem: Too many frames (30fps × 60s = 1800 frames)
+  Solution: Subsample to keyframes or temporal pooling
+
+Strategy 2: Temporal pooling before cross-attention
+  Video: Aggregate frames temporally → [segment_0, segment_1, segment_2]
+  Each segment = temporal average of 5-10 frames
+  
+  Benefit: Fewer video "tokens" for cross-attention
+  Tradeoff: Loss of temporal fine-grain detail
+
+Strategy 3: Spatial-temporal features
+  Video: Extract 3D CNN features
+  Shape: [num_segments, spatial_patches, d_model]
+  Cross-attend over both spatial and temporal dimensions
+```
+
+**4. Common Video + Text Architectures**
+
+| Model | Architecture | Cross-Attention Role |
+|---|---|---|
+| **ViLBERT** | Separate ViT (video) + BERT (text) + cross-attention layers | Bidirectional alignment between modalities |
+| **CLIP** | Vision encoder + Text encoder + cosine similarity matching | Align video & text in shared embedding space |
+| **BLIP** | Vision transformer encoder + Text decoder with cross-attention | Unified understanding + generation |
+| **Flamingo** | Vision tokens + frozen LLM + gated cross-attention | Inject visual grounding into LLM |
+| **LLaVA** | Vision encoder → Linear projection → LLM input (implicit cross-attn) | Visual features feed into LLM text stream |
+
+**Key Interview Points:**
+
+1. **Cross-attention is directional**: Query modality "asks" about Key/Value modality (not symmetric unless applied both ways)
+
+2. **Sequence length matters**: Video has 100s-1000s of frames; text has 10s-100s tokens. Cross-attention costs O(seq_text × seq_video × d_model)
+
+3. **Temporal dynamics**: Video inherently has temporal structure; must preserve it (not just treat frames as set of images)
+
+4. **Alignment challenge**: Without supervision, cross-attention learns alignment from scratch (noisy in early training). Helps to have paired video-text data.
+
+5. **Cascading errors in generation**: When text is generated sequentially (decoder style), early mistakes propagate. Cross-attention keeps video as anchor to recover.
+
+**Interview One-Liner:**
+
+Cross-attention enables multi-modal understanding by letting one modality (e.g., text queries or generated tokens) dynamically select and aggregate features from another modality (e.g., video frames) through a learned weighted combination—the attention weights reveal which frames/regions are semantically relevant to each text element.
+
+**Practical Implementation Pattern:**
+
+```python
+# Simplified video QA with cross-attention
+
+# Extract video frame features
+video_features = video_encoder(video)  # [batch, num_frames, d_model]
+
+# Encode question
+question_tokens = text_tokenizer(question)  # [batch, seq_len, d_model]
+
+# Cross-attention decoder
+for step in range(max_answer_length):
+    # Current answer token (or BOS for first step)
+    current_token_emb = get_token_embedding(answer_tokens[-1])
+    
+    # Cross-attend to video
+    video_context = cross_attention(
+        query=current_token_emb,
+        key=video_features,
+        value=video_features
+    )  # [d_model]
+    
+    # Combine with question context (self-attention on question history)
+    question_context = self_attention(question_tokens, history)
+    
+    # Fuse all contexts
+    combined = fusion(video_context + question_context)
+    
+    # Generate next answer token
+    next_token = answer_decoder(combined)
+    answer_tokens.append(next_token)
+```
+
+**Common Pitfalls:**
+
+1. **Ignoring temporal order**: Treating video frames as unordered set (loses motion/causality)
+2. **No frame preprocessing**: Raw pixels to attention is inefficient; always use visual encoder first
+3. **Insufficient masking**: Without proper masking, model can attend to "future" frames (cheating)
+4. **Over-compression**: Pooling too aggressively loses details needed for fine-grained video understanding
+5. **Training instability**: Cross-attention can be slow to converge; needs careful initialization and learning rate scheduling
+

@@ -980,4 +980,272 @@ TER(MT2) = 0.2 (1 deletion)
 5. **TER interpretable** (actual edit count) but slower than BLEU
 6. **No perfect metric**: Use multiple metrics + human evaluation for validation
 
+---
+
+## Q7. What is Token Representation in NLP?
+
+Token representation converts discrete tokens into numerical vectors that models can process.
+
+Given a vocabulary $V$ with size $|V|$, each token $w_i$ is mapped to a dense vector:
+$$e_i = E[w_i] \in \mathbb{R}^d$$
+
+where $E \in \mathbb{R}^{|V| \times d}$ is the embedding matrix, $d$ is the embedding dimension.
+
+---
+
+**1. One-Hot Encoding (baseline, sparse)**
+
+$$e_i \in \{0,1\}^{|V|}, \quad e_i[j] = \begin{cases} 1 & \text{if } j = \text{index}(w_i) \\ 0 & \text{otherwise} \end{cases}$$
+
+Problem: no semantic similarity captured, dimensionality = $|V|$ (very high, sparse).
+
+---
+
+**2. Static Word Embeddings (Word2Vec, GloVe)**
+
+Dense, learned vector per token, fixed regardless of context.
+
+Word2Vec (Skip-gram) objective:
+$$\mathcal{L} = -\sum_{t=1}^{T} \sum_{-c \leq j \leq c, j \neq 0} \log p(w_{t+j} \mid w_t)$$
+
+$$p(w_{t+j} \mid w_t) = \frac{\exp(v'^{\top}_{w_{t+j}} v_{w_t})}{\sum_{w=1}^{|V|} \exp(v'^{\top}_{w} v_{w_t})}$$
+
+where $v_{w_t}$ is the "input" embedding, $v'_{w}$ is "output" embedding, $c$ is context window size.
+
+Limitation: same vector for a word regardless of context (e.g., "bank" in river vs finance context).
+
+---
+
+**3. Contextual Embeddings (Transformer-based)**
+
+Token representation depends on surrounding context — same word gets different vectors in different sentences.
+
+$$h_i = \text{Transformer}_\theta(w_1, w_2, \ldots, w_T)_i$$
+
+where $h_i \in \mathbb{R}^d$ is the contextualized representation at position $i$, computed via self-attention over all tokens:
+
+$$\text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^{\top}}{\sqrt{d_k}}\right)V$$
+
+Final token representation combines token embedding + positional embedding:
+$$h_i^{(0)} = E[w_i] + P[i]$$
+
+then passed through $L$ transformer layers to get contextualized $h_i^{(L)}$.
+
+---
+
+**Comparison:**
+
+| Type | Context-aware? | Dimensionality | Examples |
+|---|---|---|---|
+| One-hot | No | $\|V\|$ (sparse) | — |
+| Static embedding | No | $d$ (dense, fixed ~100-300) | Word2Vec, GloVe |
+| Subword embedding | No (before context) | $d$ | BPE, WordPiece embeddings |
+| Contextual embedding | Yes | $d$ (dense, ~768-4096) | BERT, GPT, LLaMA |
+
+---
+
+**Interview Key Points:**
+
+1. **Subword tokenization** (BPE/WordPiece) solves out-of-vocabulary problem before embedding lookup
+2. **Static embeddings suffer from polysemy**: one vector per word regardless of meaning
+3. **Contextual embeddings solve polysemy** via self-attention conditioning on full sequence
+4. **Positional encoding is essential** for Transformers since attention is permutation-invariant without it
+5. **Embedding dimension trade-off**: higher $d$ captures more nuance but increases parameters ($|V| \times d$) and compute cost
+
+---
+
+## Q8. RNN Problems, How LSTM Solves Them, and Remaining LSTM Problems
+
+**1. Vanilla RNN — The Core Problem**
+
+RNN hidden state update:
+$$h_t = \tanh(W_h h_{t-1} + W_x x_t + b)$$
+
+During backpropagation through time (BPTT), the gradient w.r.t. an earlier hidden state involves a **product of Jacobians** across all timesteps:
+$$\frac{\partial \mathcal{L}}{\partial h_1} = \frac{\partial \mathcal{L}}{\partial h_T} \prod_{t=2}^{T} \frac{\partial h_t}{\partial h_{t-1}} = \frac{\partial \mathcal{L}}{\partial h_T} \prod_{t=2}^{T} W_h^\top \, \text{diag}(\tanh'(\cdot))$$
+
+Since $|\tanh'(\cdot)| \le 1$ and this term is multiplied $T$ times:
+- If the dominant eigenvalue of $W_h$ is $< 1$ → gradients shrink exponentially → **vanishing gradient** (can't learn long-range dependencies)
+- If $> 1$ → gradients grow exponentially → **exploding gradient** (unstable training, NaN losses)
+
+Practical consequence: RNNs effectively "forget" information beyond ~10-20 timesteps.
+
+---
+
+**2. How LSTM Solves This**
+
+LSTM introduces a **cell state** $C_t$ with an (mostly) **additive** update instead of purely multiplicative:
+$$C_t = f_t \odot C_{t-1} + i_t \odot \tilde{C}_t$$
+
+where gates are:
+$$f_t = \sigma(W_f[h_{t-1}, x_t] + b_f) \quad \text{(forget gate)}$$
+$$i_t = \sigma(W_i[h_{t-1}, x_t] + b_i) \quad \text{(input gate)}$$
+$$\tilde{C}_t = \tanh(W_C[h_{t-1}, x_t] + b_C) \quad \text{(candidate)}$$
+$$o_t = \sigma(W_o[h_{t-1}, x_t] + b_o), \quad h_t = o_t \odot \tanh(C_t) \quad \text{(output gate)}$$
+
+Key insight: the gradient path through $C_t$ is:
+$$\frac{\partial C_t}{\partial C_{t-1}} = f_t$$
+
+This is a **direct, additive, gated pathway** (the "constant error carousel"). If $f_t \approx 1$, gradients flow through many timesteps almost unchanged — no repeated multiplication by $W_h$ and no repeated $\tanh'$ squashing. This is why LSTM handles dependencies over 100+ steps, vs ~10-20 for vanilla RNN.
+
+---
+
+**3. LSTM Still Has Problems**
+
+**a) Vanishing gradients still happen, just less severely**
+If the forget gate $f_t \to 0$ (network learns to forget), the gradient path is still cut. Over very long sequences (1000+ tokens), $\prod_t f_t \to 0$ is still possible.
+
+**b) Strictly sequential computation — no parallelization**
+$$h_t = \text{LSTMCell}(h_{t-1}, x_t)$$
+Each timestep depends on the previous one → cannot parallelize across the sequence dimension during training. This is $O(T)$ sequential steps, making LSTM training/inference slow on GPUs (vs Transformer's $O(1)$ sequential depth with full parallelism across tokens).
+
+**c) Limited effective context in practice**
+Even though LSTM *can* theoretically model longer dependencies than RNN, empirically effective context is still limited (~100-200 tokens) — nowhere near Transformer's 128K+ context windows.
+
+**d) No direct token-to-token comparison**
+LSTM must compress ALL history into a single fixed-size vector $h_t \in \mathbb{R}^d$ — this is an information bottleneck. Transformers instead let every token attend directly to every other token via:
+$$\text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V$$
+avoiding the bottleneck entirely.
+
+**e) Harder optimization at scale**
+LSTMs don't scale as gracefully as Transformers with data/compute (no clean scaling laws), and gating complexity adds more hyperparameters and instability at very large hidden sizes.
+
+---
+
+**Interview Key Points:**
+
+1. **RNN vanishing/exploding gradients**: caused by repeated multiplication of $W_h^\top$ and $\tanh'$ across $T$ timesteps in BPTT
+2. **LSTM fix**: additive cell-state update with gates creates a "constant error carousel" — gradient path is $f_t$ instead of $W_h^\top \tanh'$
+3. **LSTM is still sequential**: $O(T)$ steps, no parallelization across time — major bottleneck vs Transformers
+4. **LSTM still has an information bottleneck**: fixed-size hidden vector must compress all history, unlike Transformer's full pairwise attention
+5. **This is exactly why Transformers replaced LSTMs** for large-scale language modeling: parallel training, no compression bottleneck, longer effective context
+
+---
+
+## Q9. Why Multi-Head Attention in NLP?
+
+**1. Single-head attention has a representational bottleneck**
+
+Standard scaled dot-product attention:
+$$\text{Attention}(Q,K,V) = \text{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V$$
+
+With a single head, the model computes **one** weighted average over $V$ per query — it must compress *all* relevant relationships (syntactic, semantic, positional, coreference, etc.) into a single softmax distribution. That's a severe bottleneck: one attention pattern cannot simultaneously capture "subject-verb agreement" AND "long-range coreference" AND "local n-gram structure" for the same token.
+
+---
+
+**2. Multi-head formulation**
+
+Project $Q, K, V$ into $h$ independent, lower-dimensional subspaces:
+$$\text{head}_i = \text{Attention}(QW_i^Q, KW_i^K, VW_i^V), \quad i = 1, \ldots, h$$
+
+$$\text{MultiHead}(Q,K,V) = \text{Concat}(\text{head}_1, \ldots, \text{head}_h)W^O$$
+
+where $W_i^Q, W_i^K \in \mathbb{R}^{d_{model} \times d_k}$, $W_i^V \in \mathbb{R}^{d_{model} \times d_v}$, and typically $d_k = d_v = d_{model}/h$ so total compute is comparable to one full-dimension head.
+
+---
+
+**3. Why this helps (the real reason)**
+
+Each head learns to attend in a **different representation subspace**, so different heads can specialize:
+- Head A: local syntax (adjacent word dependencies)
+- Head B: long-range coreference ("it" → "the cat")
+- Head C: positional/rhythm patterns
+- Head D: rare-token / entity attention
+
+Empirically (Vaswani et al. 2017, and later interpretability work like Clark et al. 2019 "What Does BERT Look At?"), heads do specialize this way — some heads attend almost entirely to the previous token, others to sentence-final tokens, others to syntactic heads/dependents.
+
+Mathematically, this is analogous to an ensemble: instead of one softmax over $d_{model}$ dimensions, you get $h$ independent softmax distributions, each with its own $QK^\top$ geometry — increasing the **expressive capacity** of the attention mechanism without increasing total parameter count much (since $d_k = d_{model}/h$ keeps compute roughly constant).
+
+---
+
+**4. Trade-offs**
+
+- Too many heads with too-small $d_k$ per head → each head has limited capacity, can become redundant (empirically, many heads *can* be pruned post-training with minimal accuracy loss — Michel et al. 2019, "Are Sixteen Heads Really Better than One?")
+- Too few heads → back to the single-head bottleneck problem
+- Standard choice: $h=8$ (original Transformer, $d_{model}=512$), scaling up to $h=32$–$96$ in large LLMs, keeping $d_k$ typically 64-128
+
+---
+
+**Interview Key Points:**
+
+1. **Single-head bottleneck**: one softmax distribution can't capture syntax + coreference + position simultaneously
+2. **Multi-head = parallel subspace attention**: each head has its own $Q,K,V$ projections, specializing in different relationship types
+3. **Compute-neutral design**: $d_k = d_{model}/h$ keeps total compute roughly the same as one full-width head
+4. **Heads empirically specialize**: interpretability studies show distinct attention patterns per head (local, positional, coreference, entity)
+5. **Redundancy exists**: many heads can be pruned post-training with minimal accuracy loss — motivates efficient attention variants (grouped-query attention, multi-query attention)
+
+---
+
+## Q10. What is Label Smoothing in NLP?
+
+**1. The problem with standard cross-entropy**
+
+Standard training uses one-hot target distribution $y$:
+$$y_k = \begin{cases} 1 & k = \text{true class} \\ 0 & \text{otherwise} \end{cases}$$
+
+Cross-entropy loss:
+$$\mathcal{L}_{CE} = -\sum_k y_k \log p_k = -\log p_{\text{true}}$$
+
+To minimize this, the model is pushed to make $p_{\text{true}} \to 1$ and all other logits $\to -\infty$. This causes:
+- **Overconfidence**: model outputs near-certain probabilities even when wrong
+- **Poor calibration**: predicted probability doesn't reflect true likelihood of correctness
+- **Overfitting to training labels**, especially harmful when labels are noisy
+
+---
+
+**2. Label smoothing formulation**
+
+Replace the hard one-hot target with a **softened** distribution:
+$$y_k^{LS} = (1-\epsilon) \cdot y_k + \frac{\epsilon}{K}$$
+
+where $\epsilon$ is a small smoothing parameter (typically 0.1), $K$ is the number of classes.
+
+So for the true class:
+$$y_{\text{true}}^{LS} = (1-\epsilon) + \frac{\epsilon}{K}$$
+
+For all other classes:
+$$y_{\text{other}}^{LS} = \frac{\epsilon}{K}$$
+
+Loss becomes:
+$$\mathcal{L}_{LS} = -\sum_k y_k^{LS} \log p_k = (1-\epsilon)(-\log p_{\text{true}}) + \frac{\epsilon}{K}\sum_k(-\log p_k)$$
+
+This is equivalent to a weighted combination of the original CE loss and the KL divergence to a uniform distribution $u$:
+$$\mathcal{L}_{LS} = (1-\epsilon)\mathcal{L}_{CE} + \epsilon \cdot D_{KL}(u \| p)$$
+
+---
+
+**3. Effect on training**
+
+- The target for the true class is now $< 1$ (e.g., 0.9 instead of 1.0 with $\epsilon=0.1$, $K$ large)
+- This **caps the maximum logit gap** the model is incentivized to produce — the optimal logit for the true class becomes finite instead of $+\infty$
+- Prevents the network from driving other logits arbitrarily low, which **improves calibration** (predicted confidence matches empirical accuracy better)
+- Acts as a regularizer, similar in spirit to weight decay but applied to the label distribution instead of the weights
+
+---
+
+**4. Where it's used in NLP**
+
+- **Machine translation** (original Transformer paper, Vaswani et al. 2017, uses $\epsilon = 0.1$) — improved BLEU despite worse perplexity (since perplexity measures exact probability match, and label smoothing intentionally reduces peak probability)
+- **Sequence-to-sequence generation** (summarization, captioning) to reduce exposure to overconfident wrong tokens during beam search
+- Less common in modern autoregressive LLM pretraining at massive scale (plain cross-entropy is standard there), but still used in classification heads, NER, and fine-tuning setups prone to label noise
+
+---
+
+**5. Trade-offs**
+
+- **Improves calibration and generalization**, especially with noisy labels
+- **Can hurt metrics that reward sharp/peaked distributions** (e.g., perplexity gets slightly worse even though downstream quality like BLEU improves)
+- Choosing $\epsilon$ too high → underconfident model, slower convergence
+- Interacts with **beam search**: smoother probabilities can change search dynamics (label smoothing is known to affect BLEU positively in MT specifically because it avoids single dominant hypothesis collapse)
+
+---
+
+**Interview Key Points:**
+
+1. **Root cause fixed**: standard CE incentivizes $p_{\text{true}} \to 1$ and other logits $\to -\infty$, causing overconfidence
+2. **Soft target formula**: $y_k^{LS} = (1-\epsilon)y_k + \epsilon/K$, equivalent to $(1-\epsilon)\mathcal{L}_{CE} + \epsilon \cdot D_{KL}(u \| p)$
+3. **Improves calibration**, not raw likelihood — perplexity can get slightly worse while downstream quality (BLEU) improves
+4. **Classic use case**: original Transformer MT training used $\epsilon=0.1$
+5. **Trade-off**: too high $\epsilon$ → underconfident, slower convergence; interacts with beam search dynamics
+
 

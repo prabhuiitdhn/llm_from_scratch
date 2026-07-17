@@ -1248,4 +1248,314 @@ $$\mathcal{L}_{LS} = (1-\epsilon)\mathcal{L}_{CE} + \epsilon \cdot D_{KL}(u \| p
 4. **Classic use case**: original Transformer MT training used $\epsilon=0.1$
 5. **Trade-off**: too high $\epsilon$ → underconfident, slower convergence; interacts with beam search dynamics
 
+---
+
+## Q11. Sinusoidal Position Embedding vs RoPE — Why, How, and Why RoPE Came After
+
+**1. Why position embeddings are needed at all**
+
+Self-attention is **permutation-invariant** — it computes weighted sums over all tokens regardless of order. Without positional information, "dog bites man" and "man bites dog" would produce identical attention outputs. Since Transformers dropped recurrence/convolution (which naturally encode order via sequential processing), we need an explicit mechanism to inject sequence order into the model.
+
+---
+
+**2. Sinusoidal Position Embeddings (original Transformer, Vaswani et al. 2017)**
+
+Formula:
+$$PE_{(pos, 2i)} = \sin\left(\frac{pos}{10000^{2i/d}}\right), \quad PE_{(pos, 2i+1)} = \cos\left(\frac{pos}{10000^{2i/d}}\right)$$
+
+where $pos$ = token position, $i$ = dimension index, $d$ = embedding dimension.
+
+**How it's used in training:**
+- Precomputed once (not learned) as a fixed matrix of shape `(max_seq_len, d_model)`.
+- **Added** (not concatenated) directly to token embeddings: `input = token_embedding + positional_embedding`, before the first encoder/decoder layer.
+- Since it's just element-wise addition, gradients flow through backprop like any other input — the PE table itself is fixed (non-parametric), only downstream weights get updated.
+
+**Why sinusoidal specifically:**
+- Each dimension corresponds to a different frequency (geometric progression from $2\pi$ to $10000 \cdot 2\pi$), giving each position a unique "fingerprint."
+- Key property: $PE_{pos+k}$ can be expressed as a **linear function** of $PE_{pos}$ (via trigonometric addition identities), so the model can theoretically learn to attend by *relative* offset, not just absolute position.
+- Generalizes to sequence lengths longer than seen in training (unlike learned absolute embeddings, which have no representation for unseen positions).
+
+**Limitation:** Despite the relative-position math property, sinusoidal PE is added **once at the input**. As it propagates through many self-attention layers, that clean relative-position signal gets diluted/entangled with content information. Attention scores $QK^T$ mix content and absolute position additively, not in a way that cleanly isolates relative distance.
+
+---
+
+**3. RoPE — Rotary Position Embedding (Su et al. 2021)**
+
+**Why it was needed despite sinusoidal PE already existing:**
+1. Sinusoidal/absolute PE injects position only at the input layer — relative position information is implicit and degrades through depth.
+2. Learned absolute PE (BERT-style) can't extrapolate beyond max trained length at all.
+3. We actually want attention scores to depend on **relative distance between tokens**, not absolute positions — more linguistically meaningful (e.g., "the word 3 tokens before me" matters more than "I'm at position 47").
+
+**Core idea:** Instead of *adding* a position vector, RoPE **rotates** the query and key vectors in a multi-dimensional space by an angle proportional to their position, *before* computing the dot product.
+
+For a 2D pair of dimensions, position $m$ rotates the vector by angle $m\theta$:
+$$f(x, m) = \begin{pmatrix}\cos m\theta & -\sin m\theta \\ \sin m\theta & \cos m\theta\end{pmatrix} x$$
+
+Applied across all dimension pairs with different frequencies $\theta_i$ (similar geometric schedule to sinusoidal).
+
+**The key trick:** When computing $q_m^T k_n$ (attention dot product) between rotated query at position $m$ and rotated key at position $n$, the result depends **only on $(m-n)$**, the relative distance — the absolute rotation cancels out algebraically. This bakes relative position awareness directly into every attention computation, not just at the input.
+
+**How it's applied in training:**
+- No separate embedding table added to inputs. At each attention layer, Q and K vectors are rotated using precomputed sin/cos tables indexed by position, right before the $QK^T$ dot product.
+- Parameter-free (like sinusoidal) but re-applied at every layer's attention, not just once at the input.
+
+**Advantages over sinusoidal:**
+- Naturally decays attention with distance (long-range tokens get less "coherent" rotation alignment), matching intuitive linguistic locality bias.
+- Better length extrapolation in practice (with techniques like NTK-aware scaling / position interpolation, used in LLaMA, GPT-NeoX).
+- Cleaner theoretical guarantee of relative-position dependence at every layer, not just approximately at the input.
+
+---
+
+**Interview Key Points:**
+
+1. **Position embeddings exist** because self-attention is permutation-invariant and needs explicit order information.
+2. **Sinusoidal PE** is added once at the input as a fixed, non-learned matrix; has a nice relative-position math property but it degrades through depth since it's injected only once.
+3. **RoPE rotates Q/K vectors at every attention layer** so that the dot product depends purely on relative distance $(m-n)$, not absolute position.
+4. **RoPE came after sinusoidal PE** because we wanted relative position info to persist consistently through all layers (not just at input) and to extrapolate better to longer sequences.
+5. **RoPE is the default in modern LLMs** (LLaMA, Mistral, Qwen, GPT-NeoX family) due to better long-context extrapolation and cleaner relative-position modeling.
+
+---
+
+## Q12. What is Sliding Window Attention (SWA)?
+
+**1. The problem it solves**
+
+Standard full self-attention computes attention scores between **every pair of tokens** in a sequence, giving $O(n^2)$ time and memory complexity where $n$ is sequence length. For long sequences (e.g., 32K, 100K tokens), this becomes prohibitively expensive — both in compute and GPU memory (the $n \times n$ attention matrix explodes).
+
+**2. Core idea**
+
+Instead of letting each token attend to *all* other tokens, sliding window attention restricts each token to only attend to a fixed-size local window of nearby tokens (e.g., the previous $w$ tokens on each side).
+
+$$\text{Attention}(q_i) \rightarrow \text{keys/values from } j \in [i-w, i+w]$$
+
+This reduces complexity from $O(n^2)$ to $O(n \cdot w)$, since each token only computes attention scores against $w$ neighbors instead of all $n$ tokens.
+
+**3. How it's implemented**
+
+- A **banded/local attention mask** is applied to the $QK^T$ score matrix — positions outside the window $[i-w, i+w]$ are masked to $-\infty$ before softmax, just like causal masking but with an additional distance cutoff.
+- Window size $w$ is a fixed hyperparameter (e.g., 4096 tokens in Mistral).
+- Often combined with **causal masking** in decoder-only LLMs, so a token only attends to the window of *past* tokens, not future ones.
+
+**4. Why it still works for long-range dependencies**
+
+Even though each layer only sees a local window, stacking multiple layers effectively expands the **receptive field**, similar to how CNNs build large receptive fields from small kernels:
+
+$$\text{receptive field at layer } L \approx L \times w$$
+
+So after enough layers, information from distant tokens can indirectly propagate through intermediate tokens — layer 1 mixes info within a window, layer 2 mixes windows-of-windows, etc.
+
+**5. Real-world usage**
+
+- **Mistral 7B** uses sliding window attention (window = 4096) combined with a rolling KV-cache, enabling it to handle sequences longer than the window through this layer-stacking receptive field growth, while keeping memory bounded.
+- **Longformer** combines sliding window attention with a few **global attention** tokens (e.g., `[CLS]`, question tokens in QA) that attend to everything, blending local efficiency with global context where needed.
+- **BigBird** similarly combines local (sliding window) + global + random attention patterns for a sparse but effective full-context approximation.
+
+**6. Trade-offs**
+
+- **Big win**: linear-ish memory/compute in sequence length → enables much longer context windows in practice.
+- **Risk**: pure local windows alone can lose direct long-range dependencies within a single layer — mitigated by depth (receptive field growth) or hybrid global tokens.
+- Works especially well combined with **rolling/sliding KV-cache** during inference, since you don't need to store the full history, just the current window — big memory savings for generation.
+
+---
+
+**Interview Key Points:**
+
+1. **Motivation**: reduces $O(n^2)$ full attention to $O(n \cdot w)$ by restricting attention to a local neighborhood.
+2. **Mechanism**: banded attention mask limiting each token's attention to $[i-w, i+w]$ (or causal variant $[i-w, i]$).
+3. **Long-range info still flows** via receptive field growth across stacked layers (like CNN depth).
+4. **Used in production LLMs**: Mistral (pure sliding window + rolling cache), Longformer/BigBird (hybrid local + global + random).
+5. **Trade-off**: efficiency vs. potential loss of direct single-hop long-range attention — addressed via depth or added global tokens.
+
+---
+
+## Q13. What is Multi-Query Attention (MQA)?
+
+**1. The problem it solves**
+
+In standard **Multi-Head Attention (MHA)**, each of the $h$ heads has its **own separate Key and Value projections**, so during autoregressive generation you must cache separate K/V tensors per head. For long sequences and large batch sizes, this **KV-cache** becomes a major memory bottleneck during inference — it's often the dominant cost, not the model weights themselves.
+
+**2. Core idea**
+
+Multi-Query Attention (Shazeer, 2019) keeps **multiple query heads** (as in standard MHA) but shares a **single Key and Value projection** across all heads:
+
+$$Q_i = X W_Q^i \quad (i = 1, \dots, h \text{ separate heads})$$
+$$K = X W_K, \quad V = X W_V \quad (\text{shared across all heads})$$
+
+So instead of $h$ separate $K, V$ pairs, there's just **one** $K, V$ pair, and all $h$ query heads attend using it.
+
+**3. Why this helps at inference time**
+
+- **KV-cache size drops by a factor of $h$** (number of heads) — e.g., with 32 heads, cache memory shrinks ~32×.
+- This directly speeds up autoregressive decoding since memory bandwidth (loading the KV-cache at every generation step) is often the bottleneck, not compute (FLOPs).
+- Smaller cache also means **larger batch sizes** fit in GPU memory, improving throughput for serving.
+
+**4. Trade-off**
+
+- Sharing one K/V across all heads reduces representational diversity — different heads can no longer learn to attend to different "views" of keys/values, only different query projections. This can **slightly hurt model quality/accuracy** compared to full MHA, especially at larger scale.
+- It's a **quality vs. inference-efficiency trade-off**, primarily motivated by production serving costs, not training-time quality.
+
+**5. Grouped-Query Attention (GQA) — the middle ground**
+
+Because pure MQA can hurt quality, **GQA** (used in LLaMA-2 70B, Mistral, etc.) is a compromise:
+- Query heads are divided into $g$ groups, and each group shares its own K/V projection (instead of 1 shared pair for all heads, or $h$ separate pairs).
+- $g=1$ recovers MQA; $g=h$ recovers standard MHA.
+- GQA retains most of the inference speed benefit of MQA while recovering most of the quality of full MHA — it's now the standard choice in most modern open LLMs.
+
+**6. Where it's used**
+
+- **PaLM** was among the first large models to adopt MQA for efficient serving.
+- **Falcon** uses MQA.
+- **LLaMA-2/3, Mistral, Qwen** use **GQA** as the practical middle-ground default.
+
+---
+
+**Interview Key Points:**
+
+1. **Motivation**: reduce KV-cache memory and memory-bandwidth bottleneck during autoregressive decoding.
+2. **Mechanism**: multiple query heads, but a single shared K/V projection (vs. per-head K/V in standard MHA).
+3. **Benefit**: ~$h\times$ smaller KV-cache → faster decoding, bigger batch sizes, cheaper serving.
+4. **Cost**: reduced representational diversity across heads → potential quality drop at scale.
+5. **GQA is the practical successor** — groups of heads share K/V, balancing MQA's speed with MHA's quality; used in LLaMA-2/3, Mistral, Qwen.
+
+---
+
+## Q14. What is Segment Embedding in BERT Architecture?
+
+**1. Why they're needed**
+
+BERT is trained with two objectives, one of which — **Next Sentence Prediction (NSP)** — requires processing **two sentences packed into a single input sequence** (e.g., Sentence A and Sentence B), separated by a `[SEP]` token. The model needs to know **which tokens belong to Sentence A vs. Sentence B**, since self-attention alone has no notion of "sentence boundary" beyond the `[SEP]` token itself. Segment embeddings provide this explicit signal.
+
+**2. How it works**
+
+BERT's final input representation for each token is the **sum of three embeddings**:
+
+$$\text{Input}_i = \text{TokenEmbedding}_i + \text{PositionEmbedding}_i + \text{SegmentEmbedding}_i$$
+
+- **Segment embedding** is a learned embedding from a table of just **2 rows** (for the standard 2-segment case): $E_A$ for "Sentence A" and $E_B$ for "Sentence B".
+- Every token in Sentence A (including `[CLS]` and the first `[SEP]`) gets $E_A$ added; every token in Sentence B (including the final `[SEP]`) gets $E_B$ added.
+
+**Example input construction:**
+```
+Tokens:   [CLS] the cat sat [SEP] it slept [SEP]
+Segment:    A    A   A   A    A    B   B     B
+```
+
+**3. How it's trained**
+
+- The segment embedding table ($E_A$, $E_B$) is a small learnable parameter matrix, just like token/position embeddings — updated via standard backprop during pretraining.
+- Used jointly with the **NSP task**: given Sentence A and Sentence B, the model predicts via the `[CLS]` token's final representation whether B actually follows A in the original text, or is a random sentence. Segment embeddings let the model distinguish the two spans it must relate to each other for this task.
+- Also present (and passed through, though often just set to segment A) during **single-sentence tasks** like classification, since BERT's architecture always expects a segment ID input.
+
+**4. Relevance / why it matters**
+
+- Enables BERT to handle **sentence-pair tasks** natively: NSP (pretraining), and downstream tasks like **Natural Language Inference (NLI)**, **Question Answering** (question = segment A, passage = segment B), **paraphrase detection**, **sentence similarity** — all of which require reasoning over *two* distinct text spans in one forward pass.
+- Without segment embeddings, the model would only have `[SEP]` as a boundary marker, and no reusable dedicated signal that "these two chunks play different roles" — segment embeddings make this distinction explicit and learnable per-task.
+
+**5. Contrast with later models**
+
+- **RoBERTa** removed the NSP objective (found it wasn't very useful and even slightly harmful) but *kept* segment-style embeddings mainly for compatibility, later simplifying to single continuous input packing without needing a strict 2-segment split for most training.
+- **GPT-style decoder-only LLMs** don't use segment embeddings at all — they're purely autoregressive over a single flat token stream; sentence/turn boundaries (e.g., in chat models) are instead encoded via special tokens (e.g., `<|user|>`, `<|assistant|>`) rather than a dedicated segment embedding table.
+- **ALBERT/ELECTRA** and other BERT variants retain the segment embedding mechanism since they still use similar pretraining objectives on sentence pairs.
+
+---
+
+**Interview Key Points:**
+
+1. **Purpose**: lets BERT distinguish tokens from Sentence A vs. Sentence B within a single packed input sequence.
+2. **Mechanism**: a learned embedding table with 2 rows ($E_A$, $E_B$), **added** to token + position embeddings before the first transformer layer.
+3. **Tied to NSP pretraining task** — critical for sentence-pair understanding (NLI, QA, paraphrase detection).
+4. **Later models drop or replace it**: RoBERTa de-emphasizes NSP; GPT-style decoder LLMs use special tokens instead of segment embeddings since they're single-stream autoregressive models.
+5. **Key exam trap**: segment embedding ≠ position embedding — segment marks *which sentence*, position marks *where in the sequence*; both are added together with token embeddings.
+
+---
+
+## Q15. Decoding Strategies for Next-Token Prediction (Greedy, Beam Search, Sampling, and More)
+
+Once a language model outputs a probability distribution $p_\theta(w_t \mid w_{<t})$ over the vocabulary at each step, we need a **decoding strategy** to actually pick which token to emit. This choice dramatically affects output quality, diversity, and coherence — the model's probabilities alone don't determine the final text.
+
+---
+
+**1. Greedy Decoding**
+
+$$w_t = \arg\max_w \, p_\theta(w \mid w_{<t})$$
+
+**Intuition:** At every step, just pick the single most probable next token. Simple, deterministic, fast (no branching).
+
+**Problem:** Locally optimal choices don't guarantee a globally optimal sequence. It can get stuck in repetitive loops ("I am a I am a I am a...") because once a slightly wrong token is chosen, the model just keeps confidently continuing down that path — no way to "undo" an early mistake.
+
+---
+
+**2. Beam Search**
+
+**Intuition:** Instead of committing to one path, keep track of the **top-$k$ most probable partial sequences ("beams")** at each step, expand each by one token, then again keep only the top-$k$ overall.
+
+$$\text{score}(y_{1:t}) = \sum_{i=1}^{t} \log p_\theta(y_i \mid y_{<i})$$
+
+- $k$ = beam width. $k=1$ reduces to greedy decoding.
+- Explores more of the search space than greedy, so it finds higher-probability full sequences overall (useful for **Machine Translation**, where there's usually one "correct" answer and we want the single best output).
+- **Downside**: Beams tend to converge to similar, generic, "safe" text — bad for open-ended generation (produces bland, repetitive output); also more expensive (higher latency, $k\times$ compute).
+- Often combined with **length normalization** (dividing score by sequence length) since raw log-prob sums naturally favor shorter sequences.
+
+---
+
+**3. Temperature Sampling**
+
+$$w_t \sim \text{softmax}(z_t / \tau)$$
+
+**Intuition:** Instead of deterministically picking the max, **sample** from the probability distribution — but first reshape it using temperature $\tau$:
+- $\tau \to 0$: distribution sharpens toward the max (approaches greedy).
+- $\tau = 1$: unchanged distribution (raw model probabilities).
+- $\tau > 1$: distribution flattens, more randomness/diversity, but risk of incoherence.
+
+Adds controlled randomness so outputs aren't always identical for the same prompt — useful for creative/open-ended generation.
+
+---
+
+**4. Top-$k$ Sampling**
+
+**Intuition:** Restrict sampling to only the $k$ most probable tokens (zero out the rest), then renormalize and sample.
+
+- Prevents sampling from the "long tail" of very low-probability, nonsensical tokens.
+- **Weakness**: $k$ is fixed regardless of context — sometimes the model is very confident (only 2 tokens matter) or very uncertain (50 tokens are plausible), but top-$k$ doesn't adapt to that.
+
+---
+
+**5. Top-$p$ / Nucleus Sampling**
+
+**Intuition:** Instead of a fixed count $k$, take the smallest set of tokens whose **cumulative probability mass** exceeds threshold $p$ (e.g., 0.9), then sample only from that dynamic set.
+
+$$V_p = \min \left\{ |V'| : \sum_{w \in V'} p_\theta(w) \geq p \right\}$$
+
+- Adapts to the model's confidence: if the model is very sure, the nucleus is small (few tokens); if uncertain, it naturally grows to include more candidates.
+- Generally produces more natural, less repetitive text than top-$k$ or pure temperature sampling — the current default in most production LLM chat interfaces (often combined with a moderate temperature).
+
+---
+
+**6. Combining Techniques**
+
+In practice, most systems (e.g., GPT-family serving) combine **temperature + top-$k$ + top-$p$** together, plus:
+- **Repetition penalty**: reduces probability of tokens already generated, to combat loops.
+- **No-repeat n-gram blocking**: hard-blocks repeating an exact n-gram already seen.
+
+---
+
+**7. Contrastive Search (a more modern approach)**
+
+**Intuition:** Balances model confidence with **diversity via a degeneration penalty** — it picks the next token that is likely *and* semantically different (low cosine similarity in hidden-state space) from previous tokens, explicitly discouraging repetitive/degenerate text without needing randomness at all (still deterministic).
+
+$$w_t = \arg\max_{w \in V^{(k)}} \Big[(1-\alpha)\, p_\theta(w) - \alpha \max_{j<t} \text{sim}(h_w, h_{y_j})\Big]$$
+
+Useful when you want high-quality, non-repetitive **deterministic** output (no sampling randomness) — an alternative to top-$p$ sampling.
+
+---
+
+**Interview Key Points:**
+
+1. **Greedy** = fastest, most deterministic, but prone to repetition/looping due to no backtracking.
+2. **Beam search** = keeps top-$k$ hypotheses, better for tasks with one "correct" target (MT, summarization), but produces generic/bland text for open-ended generation and is more expensive.
+3. **Temperature/top-$k$/top-$p$ sampling** = introduce controlled randomness for diverse, natural, open-ended generation; top-$p$ is generally preferred since it **adapts to model confidence** dynamically, unlike fixed top-$k$.
+4. **Trade-off axis**: determinism/quality-for-single-answer (greedy, beam) vs. diversity/naturalness (sampling methods) — task type dictates the right choice.
+5. **Repetition penalty / n-gram blocking** are practical add-ons layered on top of any strategy to fight degenerate loops.
+6. **Contrastive search** is a newer deterministic alternative that explicitly penalizes semantic similarity to prior tokens, avoiding the incoherence risk of pure sampling while still avoiding greedy's repetition problem.
+
 

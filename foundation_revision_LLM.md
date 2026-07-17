@@ -469,3 +469,380 @@ answer = llm.generate(prompt + context)
 
 # Result: Answer grounded in best-ranked documents
 ```
+
+---
+
+## Q2. What is Text Classification in NLP?
+
+**Definition:**
+
+Text classification means mapping a text sequence to one or more predefined labels.
+
+Given text $x = (w_1, w_2, \ldots, w_T)$, learn a function:
+
+$$f_\theta: x \rightarrow y, \quad y \in \mathcal{Y}$$
+
+where $\mathcal{Y}$ is the label set (e.g., {spam, ham}, {positive, negative, neutral}).
+
+---
+
+**Single-Label Multiclass Classification**
+
+Probability for class $k$:
+$$p_\theta(y=k \mid x) = \text{softmax}(z_k) = \frac{e^{z_k}}{\sum_{j=1}^{C} e^{z_j}}$$
+
+Prediction:
+$$\hat{y} = \arg\max_k p_\theta(y=k \mid x)$$
+
+Cross-Entropy Loss:
+$$\mathcal{L}_{CE} = -\sum_{i=1}^{N} \log p_\theta(y_i \mid x_i)$$
+
+---
+
+**Multi-Label Classification**
+
+Probability for label $j$ (independent binary decisions):
+$$p_\theta(y_j = 1 \mid x) = \sigma(z_j) = \frac{1}{1 + e^{-z_j}}$$
+
+Binary Cross-Entropy Loss:
+$$\mathcal{L}_{BCE} = -\sum_{i=1}^{N} \sum_{j=1}^{C} \left[ y_{ij} \log p_{ij} + (1-y_{ij}) \log(1-p_{ij}) \right]$$
+
+---
+
+**Intuition:** 
+
+Model learns semantic features from text and uses them to separate classes in representation space.
+
+**Evaluation metrics:** Accuracy, macro-F1, micro-F1, ROC-AUC.
+
+**Interview Key Points:**
+
+1. **Single-label assumes exactly one label per instance**; multi-label allows multiple labels
+2. **Softmax enforces probabilistic constraint**: $\sum_k p_k = 1$
+3. **Sigmoid for multi-label**: Each label decision is independent (probability ∈ [0,1], no constraint to sum to 1)
+4. **Architecture**: Typically uses a pre-trained encoder (BERT, RoBERTa) + linear classification head
+5. **Common applications**: Sentiment analysis, spam detection, topic categorization, intent classification
+
+---
+
+## Q3. What are Semantic Extraction, Intent Detection, Language Detection, and Topic Modeling?
+
+**1. Semantic Extraction**
+
+Extracts structured meaning (entities, relationships, concepts) from unstructured text.
+
+Given text $x$, extract semantic elements:
+$$\text{entities}, \text{relations}, \text{attributes} = \text{SemanticExtractor}_\theta(x)$$
+
+Common formulation (Named Entity Recognition):
+$$p_\theta(y_t \mid x, t) = \text{softmax}(W_h h_t + b)$$
+where $h_t$ is the contextual representation at token $t$, $y_t$ is the entity tag.
+
+Example: "Apple CEO Tim Cook announced Q4 earnings" → entities: {Apple, Tim Cook}, relation: {CEO-of}.
+
+---
+
+**2. Intent Detection**
+
+Classifies user utterance into predefined intents (what the user wants to do).
+
+Given utterance $u$, detect intent:
+$$p_\theta(i \mid u) = \text{softmax}(W [u_{cls}; \text{pooling}(h_1, \ldots, h_T)] + b)$$
+
+where $u_{cls}$ is the [CLS] token representation from encoder, intent $i \in \{\text{book_flight}, \text{check_weather}, \text{order_food}, \ldots\}$.
+
+Cross-Entropy loss:
+$$\mathcal{L} = -\log p_\theta(i^* \mid u)$$
+
+Example: "Show me flights to NYC" → intent: book_flight.
+
+---
+
+**3. Language Detection**
+
+Identifies which language a text is written in.
+
+Given text $x$, detect language:
+$$p_\theta(\ell \mid x) = \text{softmax}(W h_{\text{agg}} + b)$$
+
+where $h_{\text{agg}}$ is aggregated representation (mean pooling or attention), $\ell \in \{\text{English}, \text{Spanish}, \text{Mandarin}, \ldots\}$.
+
+Often uses character $n$-gram features or subword tokenization to capture language-specific patterns.
+
+Example: "Bonjour, comment allez-vous?" → language: French.
+
+---
+
+**4. Topic Modeling**
+
+Discovers latent topics in a corpus; each document is a mixture of topics, each topic is a distribution over words.
+
+Latent Dirichlet Allocation (LDA) probabilistic model:
+
+$$p(w_d \mid \theta_d, \beta) = \sum_{z=1}^{K} p(w \mid z, \beta) \cdot p(z \mid \theta_d)$$
+
+where:
+- $\theta_d$ = topic distribution for document $d$ (Dirichlet prior)
+- $z$ = latent topic (1 to K)
+- $\beta$ = word distribution per topic
+- $w_d$ = observed words in document
+
+Joint likelihood:
+$$p(D) = \prod_{d=1}^{M} \int p(\theta_d) \prod_{n=1}^{N_d} \sum_{z=1}^{K} p(z \mid \theta_d) p(w_{d,n} \mid z) d\theta_d$$
+
+Inference via Gibbs sampling or variational inference to estimate $\theta_d$ and $\beta$.
+
+Example: news corpus → topics: {politics, sports, technology, entertainment}.
+
+---
+
+**Key Distinctions:**
+
+| Task | Input | Output | Granularity |
+|---|---|---|---|
+| Semantic extraction | Text | Entities, relations | Token/phrase level |
+| Intent detection | Utterance | Intent class | Utterance level |
+| Language detection | Text | Language label | Document level |
+| Topic modeling | Corpus | Topics, distributions | Document/corpus level |
+
+---
+
+## Q4. What are POS Tagging, NER, Dependency Parsing, and Constituency Parsing?
+
+**1. Part-of-Speech (POS) Tagging**
+
+Assigns grammatical tags to each word in a sentence.
+
+Given sequence $x = (w_1, w_2, \ldots, w_T)$, predict tag sequence $y = (t_1, t_2, \ldots, t_T)$ where $t_i \in \{\text{NOUN}, \text{VERB}, \text{ADJ}, \text{DET}, \ldots\}$.
+
+Formulation (sequence tagging):
+$$p_\theta(y \mid x) = \prod_{t=1}^{T} p_\theta(y_t \mid x, t)$$
+
+Per-token probability:
+$$p_\theta(y_t = k \mid x, t) = \text{softmax}(W h_t + b)_k$$
+
+where $h_t$ is contextual representation of token $t$.
+
+Cross-Entropy loss:
+$$\mathcal{L}_{POS} = -\sum_{i=1}^{N} \sum_{t=1}^{T_i} \log p_\theta(y_t^* \mid x_i, t)$$
+
+Example: "The cat sat" → {DET, NOUN, VERB}.
+
+---
+
+**2. Named Entity Recognition (NER)**
+
+Identifies entities (person, organization, location, etc.) and their boundaries in text.
+
+Given text $x$, predict entity labels $y_t \in \{\text{O}, \text{B-PER}, \text{I-PER}, \text{B-ORG}, \text{I-ORG}, \ldots\}$ using BIO tagging scheme.
+
+Per-token tagging:
+$$p_\theta(y_t \mid x, t) = \text{softmax}(W h_t + b)$$
+
+Sequence likelihood:
+$$p_\theta(y \mid x) = \prod_{t=1}^{T} p_\theta(y_t \mid x, t)$$
+
+Can incorporate CRF (Conditional Random Field) for transition constraints:
+$$p_\theta(y \mid x) = \frac{\prod_{t=1}^{T} \exp(W_{y_{t-1}, y_t} + s_t(y_t))}{\sum_{y'} \prod_{t=1}^{T} \exp(W_{y'_{t-1}, y'_t} + s_t(y'_t))}$$
+
+where $s_t(y_t)$ is emission score, $W_{y_{t-1}, y_t}$ is transition score.
+
+Example: "John works at Google" → {B-PER, O, O, B-ORG}.
+
+---
+
+**3. Dependency Parsing**
+
+Represents sentence structure as a directed graph where words depend on other words; produces tree with head-dependent relations.
+
+Goal: predict directed edges (head, dependent, relation-type) forming a tree.
+
+Given word $i$, predict its head $h(i)$ and relation $r(i)$:
+$$\text{head}_i = \arg\max_j p_\theta(\text{head}=j \mid x, i)$$
+$$r_i = \arg\max_r p_\theta(\text{rel}=r \mid x, i, \text{head}=j)$$
+
+Score function (biaffine model):
+$$s(i, j) = h_i^T U h_j + h_i^T v$$
+
+where $h_i, h_j$ are representations of word $i$ and candidate head $j$.
+
+Arc loss (maximum spanning tree):
+$$\mathcal{L}_{arc} = -\sum_{i=1}^{T} \log p_\theta(\text{head}_i^* \mid x)$$
+
+Example: "The cat sat on the mat" → edges: {sat→cat, sat→on, on→mat, cat→the, mat→the}.
+
+Visual dependency tree:
+```
+        sat
+       /   \
+      cat   on
+      |     |
+     the   mat
+           |
+          the
+```
+
+---
+
+**4. Constituency Parsing**
+
+Represents sentence structure as nested phrases (constituents); produces a tree with phrase structure.
+
+Goal: build hierarchical tree where each internal node is a syntactic category (NP, VP, PP, etc.) and leaves are words.
+
+Chart parsing with dynamic programming:
+$$s(i, j, X) = \max_{k, Y, Z} [s(i, k, Y) + s(k, j, Z) + p(X \to Y Z)]$$
+
+where $s(i, j, X)$ is the score for span $(i, j)$ under non-terminal $X$.
+
+Parsing loss (cross-entropy over tree structures):
+$$\mathcal{L} = -\log p_\theta(\text{tree}^* \mid x)$$
+
+Example tree for "The cat sat":
+```
+        S
+       /|\
+      NP VP
+      |  |
+     DET NOUN VERB
+      |   |    |
+     The cat  sat
+```
+
+---
+
+**Key Distinctions:**
+
+| Task | Structure | Output Type | Granularity |
+|---|---|---|---|
+| POS Tagging | Linear sequence | Syntactic labels per token | Token level |
+| NER | Linear sequence | Entity boundaries + labels | Span/token level |
+| Dependency Parsing | Directed tree | Head-dependent arcs + relations | Pairwise relations |
+| Constituency Parsing | Phrase tree | Hierarchical phrase structure | Multi-level hierarchy |
+
+---
+
+**Interview Key Points:**
+
+1. **POS & NER are local tagging problems** (sequence labeling); dependency & constituency parsing are **structural problems** (tree inference)
+2. **Dependency parsing is simpler** (O(n³) or O(n²) with biaffine); constituency parsing is **more complex** (requires CKY chart parsing, O(n³|G|))
+3. **Constituency trees encode phrase groups**; dependency trees encode grammatical relations
+4. **CRF constraints improve tagging by modeling transitions**; CKY constraints improve parsing by enforcing tree structure
+5. **Modern neural approaches use Transformers + span/arc scoring** for all four tasks
+
+---
+
+## Q5. What are Machine Translation, Question Answering, Summarization, and Text Generation?
+
+**1. Machine Translation (MT)**
+
+Translates text from source language to target language.
+
+Given source text $x = (w_1^{src}, \ldots, w_T^{src})$, generate target text $y = (w_1^{tgt}, \ldots, w_M^{tgt})$.
+
+Sequence-to-sequence formulation:
+$$p_\theta(y \mid x) = \prod_{t=1}^{M} p_\theta(w_t^{tgt} \mid w_{<t}^{tgt}, x)$$
+
+Encoder-decoder architecture:
+$$h_{\text{enc}} = \text{Encoder}_\theta(x)$$
+$$p_\theta(w_t^{tgt} \mid w_{<t}^{tgt}, x) = \text{softmax}(W \text{Decoder}_\theta(w_{<t}^{tgt}, h_{\text{enc}}))$$
+
+Negative log-likelihood loss (cross-entropy):
+$$\mathcal{L}_{MT} = -\sum_{i=1}^{N} \sum_{t=1}^{M_i} \log p_\theta(w_t^{tgt,*} \mid w_{<t}^{tgt,*}, x_i)$$
+
+Example: English "The cat sat" → French "Le chat s'est assis".
+
+---
+
+**2. Question Answering (QA)**
+
+Generates or retrieves answer to a given question, often conditioned on context document(s).
+
+**Extractive QA**: select span from context
+$$p_\theta(\text{start}=i, \text{end}=j \mid q, d) = \frac{\exp(s_{\text{start}}(i) + s_{\text{end}}(j))}{\sum_{i',j'} \exp(s_{\text{start}}(i') + s_{\text{end}}(j'))}$$
+
+where $s_{\text{start}}(i), s_{\text{end}}(j)$ are token scores from contextualized encoder.
+
+**Abstractive QA**: generate answer word-by-word
+$$p_\theta(y \mid q, d) = \prod_{t=1}^{T} p_\theta(w_t \mid w_{<t}, q, d)$$
+
+Loss:
+$$\mathcal{L}_{QA} = -\sum_{i=1}^{N} \log p_\theta(y_i^* \mid q_i, d_i)$$
+
+Example: Question "Where did the cat sit?", Context "The cat sat on the mat" → Answer "on the mat".
+
+---
+
+**3. Summarization**
+
+Compresses a document into a shorter summary preserving key information.
+
+Abstractive summarization (generate summary):
+$$p_\theta(y \mid x) = \prod_{t=1}^{M} p_\theta(w_t \mid w_{<t}, x)$$
+
+where $x$ is source document, $y$ is target summary, $M \ll T$ (summary is shorter).
+
+Encoder-decoder with attention:
+$$p_\theta(w_t \mid w_{<t}, x) = \text{softmax}(W [\text{decoder}_t; c_t])$$
+
+Context vector (attention over encoder states):
+$$c_t = \sum_{s=1}^{T} \alpha_{t,s} h_s^{\text{enc}}, \quad \alpha_{t,s} = \frac{\exp(e_{t,s})}{\sum_{s'} \exp(e_{t,s'})}$$
+
+Loss (cross-entropy):
+$$\mathcal{L}_{\text{summ}} = -\sum_{i=1}^{N} \sum_{t=1}^{M_i} \log p_\theta(w_t^{*} \mid w_{<t}^{*}, x_i)$$
+
+Evaluation metrics: ROUGE-1/2/L (recall-based), BERTScore (semantic similarity).
+
+Example: Document → Summary (shorter version capturing key points).
+
+---
+
+**4. Text Generation**
+
+Generates coherent text conditioned on optional context (prompt, topic, style, etc.).
+
+Conditional text generation:
+$$p_\theta(y \mid c) = \prod_{t=1}^{T} p_\theta(w_t \mid w_{<t}, c)$$
+
+where $c$ is conditioning context (can be empty for unconditional generation, or specific for conditional).
+
+Per-token probability (autoregressive):
+$$p_\theta(w_t \mid w_{<t}, c) = \text{softmax}(W h_t + b)$$
+
+where $h_t = \text{Transformer}_\theta(w_{<t}, c)$.
+
+Decoding strategies:
+
+- **Greedy**: $w_t = \arg\max_w p_\theta(w \mid w_{<t}, c)$
+- **Beam search**: keep top-$k$ hypotheses, expand greedily
+- **Temperature sampling**: $w_t \sim \text{softmax}(z_t / \tau)$ where $\tau$ controls diversity
+- **Top-$p$ sampling**: sample from smallest set with cumulative probability ≥ $p$
+
+Training loss (cross-entropy):
+$$\mathcal{L} = -\sum_{i=1}^{N} \sum_{t=1}^{T_i} \log p_\theta(w_t^* \mid w_{<t}^*, c_i)$$
+
+Example: Prompt "Once upon a time" → Generated continuation.
+
+---
+
+**Key Distinctions:**
+
+| Task | Input | Output | Structure | Key Challenge |
+|---|---|---|---|---|
+| Machine Translation | Source text | Target text (diff. lang) | Seq2seq fixed length | Handling long-range dependencies, word order |
+| Question Answering | Question + Context | Answer span/text | Span selection or generation | Reasoning over multiple sentences |
+| Summarization | Long document | Short summary | Variable-length compression | Preserving key info, avoiding redundancy |
+| Text Generation | Optional prompt | Generated text | Open-ended | Coherence, relevance, diversity |
+
+---
+
+**Interview Key Points:**
+
+1. **MT & Summarization are compression tasks**; QA & Gen are **reasoning/reasoning+generation tasks**
+2. **Extractive QA is deterministic**; abstractive is **stochastic and open-ended**
+3. **Beam search provides better quality but higher latency** vs greedy; temperature sampling adds **controlled diversity**
+4. **ROUGE metrics are limited** for summarization (not semantic); newer metrics use embeddings or pre-trained models
+5. **Teacher forcing during training vs autoregressive decoding at test time** causes **exposure bias** — all four tasks suffer from this; solutions include scheduled sampling, beam search training
+6. **Seq2seq models require alignment** between input/output; Transformers handle this via cross-attention
+
+

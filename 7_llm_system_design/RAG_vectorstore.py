@@ -1,3 +1,4 @@
+# USE pytorch_all environment for running this!
 """
 Vector Store Implementation with HNSW (Hierarchical Navigable Small World)
 Demonstrates fast retrieval using hierarchical graph-based indexing

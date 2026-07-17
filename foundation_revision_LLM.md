@@ -845,4 +845,139 @@ Example: Prompt "Once upon a time" → Generated continuation.
 5. **Teacher forcing during training vs autoregressive decoding at test time** causes **exposure bias** — all four tasks suffer from this; solutions include scheduled sampling, beam search training
 6. **Seq2seq models require alignment** between input/output; Transformers handle this via cross-attention
 
+---
+
+## Q6. Evaluation Metrics for Sentiment Analysis, NER, and Machine Translation
+
+**1. Sentiment Analysis Evaluation Metrics**
+
+Sentiment analysis is a classification task. Common metrics:
+
+**Accuracy** (overall correctness):
+$$\text{Accuracy} = \frac{\text{# correct predictions}}{\text{# total samples}} = \frac{TP + TN}{TP + TN + FP + FN}$$
+
+**Precision** (correctness of positive predictions):
+$$\text{Precision} = \frac{TP}{TP + FP}$$
+
+**Recall** (coverage of actual positives):
+$$\text{Recall} = \frac{TP}{TP + FN}$$
+
+**F1-Score** (harmonic mean):
+$$F_1 = 2 \cdot \frac{\text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}}$$
+
+**Macro-F1** (average F1 across classes, for imbalanced data):
+$$\text{Macro-F1} = \frac{1}{C} \sum_{c=1}^{C} F1_c$$
+
+Example: Binary sentiment (positive/negative)
+```
+Predicted: Pos  Neg
+Actual Pos:  95   5   (TP=95, FN=5)
+       Neg:  10  90   (FP=10, TN=90)
+
+Precision = 95/(95+10) = 0.905
+Recall = 95/(95+5) = 0.95
+F1 = 2 * (0.905 * 0.95) / (0.905 + 0.95) = 0.927
+```
+
+---
+
+**2. Named Entity Recognition Evaluation Metrics**
+
+NER is sequence tagging but evaluated at **entity level** (not token level).
+
+**Entity-level Precision**:
+$$\text{Precision} = \frac{\text{# correctly predicted entities}}{\text{# predicted entities}}$$
+
+**Entity-level Recall**:
+$$\text{Recall} = \frac{\text{# correctly predicted entities}}{\text{# gold entities}}$$
+
+**F1-Score**:
+$$F_1 = 2 \cdot \frac{\text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}}$$
+
+Example:
+```
+Gold:      B-PER I-PER  O  B-LOC
+Predicted: B-PER B-PER  O  B-LOC
+           
+Gold entities: [PER: John Smith (0-2)], [LOC: NYC (3-4)]
+Predicted:     [PER: John (0-1)], [PER: Smith (1-2)], [LOC: NYC (3-4)]
+
+Correct predictions: 1 (LOC: NYC)
+False positives: 2 (wrong PER boundaries)
+False negatives: 1 (missed full PER: John Smith)
+
+Precision = 1/(1+2) = 0.33
+Recall = 1/(1+1) = 0.5
+F1 = 0.4
+```
+
+---
+
+**3. Machine Translation Evaluation Metrics**
+
+MT is sequence generation; metrics measure similarity between MT output and reference translation(s).
+
+**BLEU** (Bilingual Evaluation Understudy) - precision-based, n-gram overlap:
+$$\text{BLEU} = \text{BP} \cdot \exp\left(\sum_{n=1}^{N} w_n \log p_n\right)$$
+
+where:
+- $p_n$ = precision of $n$-grams (typically $N=4$)
+- $\text{BP}$ = brevity penalty (penalizes short translations):
+
+$$\text{BP} = \begin{cases} 1 & \text{if } c > r \\ e^{1-r/c} & \text{if } c \leq r \end{cases}$$
+
+where $c$ = candidate length, $r$ = reference length.
+
+**METEOR** (Metric for Evaluation of Translation with Explicit ORdering) - recall-based, includes synonyms:
+$$\text{METEOR} = (1 - \gamma) \cdot F_{\text{align}} - \gamma \cdot \text{penalty}$$
+
+where $F_{\text{align}}$ is harmonic mean of precision/recall over aligned unigrams.
+
+**TER** (Translation Edit Rate) - edit distance:
+$$\text{TER} = \frac{\text{# insertions + deletions + substitutions + shifts}}{\text{# reference words}}$$
+
+Lower TER is better.
+
+**BERTScore** (semantic similarity using embeddings):
+$$\text{BERTScore-F} = 2 \cdot \frac{P_{\text{BERT}} \cdot R_{\text{BERT}}}{P_{\text{BERT}} + R_{\text{BERT}}}$$
+
+where $P_{\text{BERT}}, R_{\text{BERT}}$ measure cosine similarity between contextualized embeddings.
+
+Example:
+```
+Reference: "The quick brown fox jumps"
+MT1:       "The fast brown fox jumps"  (synonym)
+MT2:       "The quick brown fox jump"  (missing 's')
+
+BLEU(MT1) ≈ 0.67
+BLEU(MT2) ≈ 0.67
+
+BERTScore(MT1) ≈ 0.98 (semantically similar)
+BERTScore(MT2) ≈ 0.95 (slight verb difference)
+
+TER(MT1) = 0.2 (1 substitution)
+TER(MT2) = 0.2 (1 deletion)
+```
+
+---
+
+**Key Distinctions:**
+
+| Task | Metric Type | Key Metrics | Properties |
+|---|---|---|---|
+| Sentiment Analysis | Classification | Accuracy, Precision, Recall, F1, Macro-F1 | Class-wise breakdown important |
+| NER | Sequence Tagging | Entity F1 (exact match) | Entity-level not token-level |
+| Machine Translation | Sequence Generation | BLEU, METEOR, TER, BERTScore | Multiple references, semantic aware |
+
+---
+
+**Interview Key Points:**
+
+1. **Sentiment Analysis**: Macro-F1 better for imbalanced data; confusion matrix reveals class-specific errors
+2. **NER**: Evaluate at **entity level** (exact match), NOT token accuracy (misleading)
+3. **MT BLEU limitations**: Insensitive to synonyms; BERTScore fixes this
+4. **MT metrics to use together**: BLEU + METEOR (diverse views); add BERTScore for semantic quality
+5. **TER interpretable** (actual edit count) but slower than BLEU
+6. **No perfect metric**: Use multiple metrics + human evaluation for validation
+
 

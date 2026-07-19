@@ -2199,4 +2199,70 @@ CoT prompting shows a striking **emergent capability** pattern: it provides litt
 4. **Key variants**: zero-shot CoT ("let's think step by step"), self-consistency (majority vote over multiple sampled reasoning chains), Tree-of-Thought (branching search over reasoning paths).
 5. **Modern evolution**: CoT prompting is the conceptual precursor to explicitly RL-trained "reasoning models" (o1/o3, DeepSeek-R1) that generate long internal reasoning traces natively, rather than relying on prompt engineering alone.
 
+---
+
+## Q27. What is Hallucination in NLP/LLMs? What Are the Possible Solutions to Fix This?
+
+**1. What it means**
+
+Hallucination refers to an LLM generating content that is **fluent and confident-sounding but factually incorrect, unsupported by the given context, or entirely fabricated** — the model produces plausible-looking text that doesn't correspond to reality or to the source material it was supposed to be grounded in.
+
+Two main categories:
+- **Intrinsic hallucination**: output directly contradicts the provided source/context (e.g., summarization that misstates a fact present in the document itself).
+- **Extrinsic hallucination**: output introduces information that's neither supported nor contradicted by the source — it's simply "made up" (e.g., citing a nonexistent paper, inventing an API function that doesn't exist, fabricating a statistic).
+
+**2. Why hallucination happens — the root causes**
+
+- **Fundamentally, LLMs are next-token predictors, not fact-checkers**: $p_\theta(w_t \mid w_{<t})$ is optimized to produce statistically plausible continuations, not verified true statements. Fluency and factual correctness are two separate objectives that cross-entropy training doesn't explicitly distinguish.
+- **Training data limitations**: the model absorbs whatever patterns exist in pretraining data, including errors, outdated facts, and contradictory information; it also has a **fixed knowledge cutoff** and no built-in mechanism to know what it doesn't know.
+- **Exposure bias / autoregressive error compounding**: once the model generates one incorrect or unsupported token, subsequent tokens are conditioned on that error and the model tends to continue "coherently" building on the mistake rather than self-correcting (since training via teacher forcing never exposes the model to its own errors during training).
+- **Overconfidence from standard cross-entropy training**: as discussed with label smoothing (Q10), plain CE training pushes toward peaked, confident output distributions — the model has no explicit signal to express "I'm not sure" versus committing to a specific (possibly wrong) answer.
+- **RLHF/instruction tuning can worsen this**: reward models and human raters often favor confident, detailed, "helpful-sounding" answers over hedged/uncertain ones, inadvertently training the model to sound more confident than its actual knowledge justifies (a known RLHF side effect).
+- **Missing grounding**: without retrieval or explicit context, the model must rely purely on parametric memory, which is imperfect and doesn't provide any verifiable source to check against.
+
+**3. Solutions / mitigation strategies**
+
+**a) Retrieval-Augmented Generation (RAG)**
+Ground generation in retrieved, verifiable documents rather than relying purely on the model's parametric memory:
+$$p_\theta(y \mid x, \text{retrieved docs})$$
+Directly reduces extrinsic hallucination by supplying actual source material the model can (in principle) cite/quote rather than invent. Doesn't eliminate hallucination entirely — the model can still misread or misattribute retrieved content, but substantially reduces reliance on possibly-wrong memorized "facts."
+
+**b) Better decoding/generation strategies**
+- Lower temperature / more conservative sampling reduces exposure to low-probability, potentially fabricated continuations (though excessive determinism trades off diversity).
+- **Self-consistency** (Q26): generate multiple reasoning/answer candidates and take a majority vote — reduces the chance a single hallucinated path dominates.
+
+**c) Fine-tuning/RLHF specifically targeting factuality/calibration**
+- Train reward models to explicitly penalize unsupported claims (factuality-aware reward modeling), not just "helpfulness/fluency."
+- **Reinforcement Learning from AI/Human Feedback focused on factual consistency**, rewarding hedging/abstention ("I don't know") over confident fabrication when appropriate.
+
+**d) Verification and self-critique pipelines**
+- **Chain-of-Verification (CoVe)** and similar methods: have the model generate an answer, then generate verification questions about its own claims, answer those independently, and revise the original answer based on inconsistencies found.
+- **Tool use / fact-checking agents**: have the model call external tools (search engines, calculators, databases) to verify claims before finalizing an answer, rather than trusting parametric memory alone.
+
+**e) Uncertainty estimation / calibration techniques**
+- Techniques like **label smoothing** (Q10), **temperature scaling on output logits**, or explicit **confidence scoring** help the model express uncertainty rather than false confidence — though this is an active research area since LLM confidence often doesn't correlate well with actual correctness out-of-the-box.
+- **Semantic entropy / consistency-based uncertainty**: sample multiple generations for the same query; if answers vary wildly, flag as likely-hallucinated/low-confidence, if they converge, higher confidence.
+
+**f) Structured/constrained generation**
+- For factual/structured tasks (e.g., extracting entities, citing specific data), constrain outputs to only reference verifiable spans from provided context (extractive rather than abstractive generation) where feasible.
+
+**g) Evaluation and detection metrics**
+- **FactScore, SelfCheckGPT, TruthfulQA benchmark**: specifically designed to measure hallucination rates, enabling iterative model/prompt improvement by directly targeting the failure mode instead of relying on generic quality metrics like BLEU/ROUGE, which don't capture factuality well.
+
+**4. Key trade-offs / why it's not fully solved**
+
+- **RAG helps but doesn't eliminate hallucination**: models can still ignore, misinterpret, or "hallucinate on top of" retrieved context.
+- **More conservative decoding/hedging reduces confident wrong answers, but also reduces helpfulness/completeness** — there's an inherent trade-off between being maximally useful/fluent and being maximally cautious/factually safe.
+- **No fully reliable internal "know what you don't know" signal exists yet** — this remains an open, active research problem, not a solved issue.
+
+---
+
+**Interview Key Points:**
+
+1. **Definition**: fluent but factually incorrect or fabricated output — split into **intrinsic** (contradicts given source) vs. **extrinsic** (unsupported, made-up information) hallucination.
+2. **Root cause**: LLMs are trained as next-token predictors optimizing plausibility/fluency (cross-entropy), not verified truth — combined with autoregressive error compounding and RLHF sometimes rewarding confident-sounding answers over honest uncertainty.
+3. **Primary mitigation**: **RAG** grounds generation in retrievable, verifiable source documents — the most widely used practical fix, though not a complete solution.
+4. **Secondary mitigations**: self-consistency/majority voting, self-verification pipelines (Chain-of-Verification), tool-use/fact-checking agents, factuality-aware RLHF reward shaping.
+5. **Evaluation**: dedicated hallucination-focused benchmarks (TruthfulQA, FactScore, SelfCheckGPT) are needed since standard fluency metrics (BLEU/ROUGE) don't capture factual correctness — this remains an active, unsolved research area, not a fully fixed problem.
+
 

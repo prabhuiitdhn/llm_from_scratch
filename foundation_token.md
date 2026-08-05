@@ -1358,3 +1358,53 @@ Concatenation allows **separation** → attention could shortcut by learning pos
 **Senior-Level Interview Answer:**
 
 Element-wise addition of position embeddings prevents the model from learning position-based ranking shortcuts in attention. By fusing token and position signals into a single vector (rather than concatenating them as separate channels), the model is forced to learn their interaction during gradient flow. This ensures attention weights reflect semantic similarity constrained by positional context, not position patterns alone. The mechanism is fundamental to why addition is preferred over concatenation in transformer architectures — it aligns the optimization objective with the desired learning outcome: position-aware semantic attention rather than position-dominant ranking.
+
+---
+
+## 10. Representation Learning in NLP
+
+### 10.1 What representation learning is
+
+Representation learning is the process of automatically learning **numerical vector encodings** of language (tokens, words, sentences, documents) such that the geometry of the vector space captures meaningful properties — semantic similarity, syntax, relationships, and context.
+
+Instead of hand-engineering features (TF-IDF counts, POS tags, n-gram indicators), the model learns *what to represent and how* directly from data, optimized end-to-end for a task or a self-supervised objective.
+
+```
+"king" - "man" + "woman" ≈ "queen"   (classic embedding-arithmetic example)
+```
+
+The embedding table you build during tokenisation (Section 3, "Vocabulary") is the entry point into representation learning: token IDs are meaningless integers until the embedding layer turns them into vectors that training can shape.
+
+### 10.2 Levels of representation in NLP
+
+| Level | What it captures | Example |
+|---|---|---|
+| Token/subword embedding | One fixed vector per token ID | Word2Vec, GloVe, embedding table lookup |
+| Contextual embedding | Same token, different vector depending on surrounding context | BERT, ELMo, GPT hidden states |
+| Sentence/document embedding | Pooled or [CLS]-based vector for a whole span of text | Sentence-BERT, Nomic Embed (used in RAG chunking) |
+| Cross-modal embedding | Text and another modality (image, audio) aligned in one shared space | CLIP, LLaVA vision-language embeddings |
+
+### 10.3 Historical progression
+
+1. **Static embeddings** (Word2Vec, GloVe) — one fixed vector per word regardless of context. "Bank" (river) and "bank" (money) get the same vector.
+2. **Contextual embeddings** (ELMo, BERT) — the vector for a word depends on the sentence it appears in, solving the polysemy problem above.
+3. **Transformer-based representations** — self-attention builds representations by letting every token attend to every other token; this is the backbone of modern LLMs and why causal masking (Section 9, Q22) and position-embedding fusion (Section 9, Q23) directly shape representation quality.
+4. **Contrastive representation learning** (SimCLR, CLIP, SimCSE) — representations are learned by pulling similar pairs together and pushing dissimilar pairs apart in embedding space, rather than predicting the next token or a masked token.
+
+### 10.4 Why it matters for the tokenisation-to-inference pipeline
+
+- Tokenisation decides *what* discrete units exist; representation learning decides *what those units mean* as vectors.
+- Good representations transfer across tasks (pretraining → fine-tuning) — this is the entire premise of transfer learning in NLP.
+- Representation collapse (embeddings converging to near-identical vectors, losing discriminative power) is a real production failure mode, monitored the same way tokenizer drift is monitored (Section 3, "Tokenizer drift").
+- Bi-encoder vs cross-encoder retrieval (used in RAG re-ranking) is a direct representation-learning design choice: independent representations (fast, less expressive) vs jointly-computed representations (slow, more expressive).
+
+### 10.5 Interview-ready summary
+
+Representation learning is the process of learning vector encodings of language such that vector-space geometry reflects semantic and syntactic meaning — progressing historically from static embeddings, to contextual embeddings, to transformer self-attention representations, to contrastive-learned embeddings — and it is the foundation layer that tokenisation feeds into and every downstream NLP task depends on.
+
+Key points for interview:
+1. Representation learning replaces hand-engineered features with learned, task-optimized vectors.
+2. Static embeddings (Word2Vec/GloVe) give one vector per word; contextual embeddings (BERT/GPT) give a different vector per occurrence based on context.
+3. Contrastive learning (CLIP, SimCSE) shapes representation space by similarity/dissimilarity rather than next-token or masked-token prediction.
+4. Representation collapse and embedding drift are production risks that require the same monitoring discipline as tokenizer drift.
+5. Retrieval architectures (bi-encoder vs cross-encoder) are a practical embodiment of representation-learning trade-offs: precompute-and-compare speed vs joint-attention accuracy.

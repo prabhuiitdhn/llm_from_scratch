@@ -1230,3 +1230,42 @@ Tradeoff:
 In one line: session affinity is sticky routing that keeps a session on the same server.
 
 ---
+
+## Q15: What is static quantization?
+
+### Beginner Level: Simple Intuition
+
+Static quantization converts a model's weights **and activations** to lower precision (for example, FP32 → INT8) using a **fixed, precomputed scale/zero-point** derived from a calibration step *before* inference runs — as opposed to computing quantization ranges on-the-fly per input.
+
+### How it works
+
+1. **Calibration pass**: Run a small representative dataset through the FP32 model.
+2. **Observe activation ranges**: Record min/max (or histogram) of activation values at each layer.
+3. **Compute scale + zero-point**: Derive fixed quantization parameters per tensor/channel from those observed ranges.
+4. **Freeze parameters**: Bake these scale/zero-point values into the model graph.
+5. **Inference**: Both weights and activations use INT8 math with the precomputed scales — no runtime range computation.
+
+$$x_{int8} = \text{round}\left(\frac{x_{fp32}}{\text{scale}}\right) + \text{zero\_point}$$
+
+### Static vs Dynamic Quantization
+
+| Aspect | Static Quantization | Dynamic Quantization |
+|---|---|---|
+| Weights | Quantized ahead of time | Quantized ahead of time |
+| Activations | Quantized ahead of time (fixed scale from calibration) | Quantized on-the-fly per batch at runtime |
+| Calibration data needed | Yes (representative dataset) | No |
+| Speed | Faster (no runtime range computation) | Slightly slower (per-input min/max computed at runtime) |
+| Accuracy | Can degrade if calibration data doesn't match real traffic distribution | Usually more robust to distribution shift |
+| Typical use | CNNs, fixed-shape inference pipelines | Transformers/LLMs (variable-length sequences), simpler to deploy |
+
+### Why it matters for LLM inference
+
+- Static quantization assumes a stable activation distribution — risky for LLMs since activation ranges can vary a lot across prompts, contexts, and outlier tokens (a known issue in transformer quantization).
+- This is why LLM-specific quantization methods (GPTQ, AWQ, SmoothQuant) exist: they handle **outlier-aware** calibration or move scaling factors between weights and activations rather than relying on naive static ranges.
+- Static quantization gives the best latency/throughput (no runtime overhead), but for LLMs it's typically combined with careful calibration (SmoothQuant-style) or applied only to weights (weight-only quantization, common in GPTQ/AWQ) rather than naive static activation quantization.
+
+### One-line summary
+
+Static quantization precomputes fixed scale/zero-point values from a calibration dataset so both weights and activations run in low precision with zero runtime overhead — trading calibration effort and potential distribution-shift risk for maximum inference speed.
+
+---

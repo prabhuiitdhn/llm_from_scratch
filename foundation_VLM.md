@@ -2829,3 +2829,770 @@ Ambient temperature, **starting temperature** (cold vs heat-soaked), battery sta
 6. Why does a cold-start benchmark misrepresent real-world performance, and how do you design a fair comparison?
 7. What are the trade-offs of spreading work across the NPU, GPU and CPU for thermals?
 8. How would you test the thermal controller in CI without heating a physical device?
+
+---
+
+# Q17: Hybrid on-device and cloud routing
+
+**Question:** Design the routing logic that decides when a query is handled by the on-device VLM vs a larger cloud model. Cover confidence calibration, uncertainty estimation, privacy constraints, latency SLOs, offline fallback and consistency of behaviour between the two.
+
+Numbers in the worked examples are assumptions for illustration. Paper and product references (RouteLLM, FrugalGPT, semantic entropy, conformal methods, Apple's Private Cloud Compute) are from memory, so check them before quoting.
+
+## 0. Framing
+Routing is a **decision under constraints**. You choose the route `r ∈ {on-device, cloud, hybrid, ask/decline}` to maximize quality subject to:
+- **Privacy** (a hard constraint, never traded away),
+- **Latency SLOs**,
+- **Cloud cost and energy/battery** (Q16),
+- **Availability** (offline, outages),
+- **Behavioural consistency** between the two models.
+
+A useful way to write it: `U(route) = Q − λ_L·max(0, T − SLO) − λ_C·cost − λ_E·energy`, subject to `privacy_ok(route) = true`. Privacy is a gate, not a term in the sum.
+
+A good design is **layered**:
+1. Hard policy gates (privacy, offline, user settings), fail closed.
+2. A cheap pre-router (task type, out-of-distribution score, knowledge need).
+3. On-device inference plus calibrated confidence.
+4. A context-aware deferral threshold.
+5. A redacted cloud call, with timeout and fallback.
+6. Response harmonization.
+
+## 1. Routing signals
+
+### 1.1 Query and task features (cheap, before running any model)
+- **Task type:** OCR, scene Q&A, counting, grounding, long-form reasoning, math, "needs current knowledge or the web".
+- **Query features:** language, question length, expected output length, multi-image or video, tool or API need.
+- **Image features:** text density, resolution, blur or low light, similarity to the training distribution.
+
+### 1.2 Model-based confidence (after the small model has run)
+- **Token-level statistics:** mean and minimum log-probability, entropy, top-2 margin, length-normalized sequence probability. For classification-style or multiple-choice answers, use the calibrated probability of the chosen option.
+- **Self-consistency and semantic entropy:** sample n answers and measure semantic agreement. Strong, but n× decode cost, so use it only for borderline cases. A cheaper variant compares the greedy answer with one or two sampled answers, or with answers from a second view of the image (different crop or resolution).
+- **Learned correctness probe:** a small linear or MLP head on hidden states the model already computed, trained to predict "is this answer correct". Almost free at inference.
+- **Verbalized confidence** ("I'm 80% sure"): usually poorly calibrated in small models, so use with caution.
+- **Visual-grounding checks (Q9):** token probabilities fail when the model is confidently wrong because of language priors. Add:
+  - an answer-depends-on-the-image test (compare the answer or logits with a corrupted or blank image),
+  - an OCR-engine cross-check for text answers,
+  - a detector cross-check for object claims.
+- **Out-of-distribution score:** distance of the image embedding from the training distribution (kNN or Mahalanobis). Unusual conditions (night, a rare device, strange screens) should push the query up.
+
+### 1.3 Context signals
+Connectivity quality (RTT, bandwidth, signal, metered or roaming), battery, thermal state (Q16), memory pressure (Q14), cloud health and load, user settings ("never send images", offline mode), enterprise policy, region, cost quota.
+
+### 1.4 Privacy signals
+A **sensitivity classifier** on the input (faces, documents, financial or health content, screens with personal data, children, home interiors) plus user consent state. See section 4.
+
+## 2. Routing architectures
+
+| Pattern | How it works | Pros | Cons |
+|---|---|---|---|
+| **A. Rules** | Static policy by task, privacy and connectivity | Predictable, auditable, the right base layer | Coarse, no adaptation to difficulty |
+| **B. Pre-routing classifier** | A learned model predicts, before any inference, which model can handle the query (RouteLLM-style routers trained on preference or outcome data) | No wasted on-device compute for queries that will go to the cloud | Less accurate than post-hoc confidence |
+| **C. Cascade (deferral)** | Run the small model, compute confidence, defer to cloud if low (FrugalGPT-style, "learning to defer") | Most queries stay local, high accuracy per cost | A deferred query pays `T_local + T_cloud` |
+| **D. Hybrid collaboration** | Split the work (see below) | Can improve quality, privacy, bandwidth | More complex, more failure modes |
+| **E. Learned policy (contextual bandit / RL)** | Optimize a utility reward with exploration, evaluated off-policy from logs | Adapts to real traffic | Needs careful safety constraints and exploration design |
+
+**Hybrid collaboration patterns:**
+- **Perception on-device, reasoning in the cloud:** the device turns the image into structured text (objects, OCR text, scene graph, PII scrubbed), and a cloud LLM reasons over a **text-only payload of a few KB**. This is privacy-friendly and cheap in bandwidth, and fits a home robot well.
+- **Split computing:** run the vision encoder on-device and send visual tokens to the cloud LLM. Bandwidth is rarely better: 320 tokens × 1,536 × 2 B ≈ 1 MB of features versus about 200 to 300 KB for a compressed JPEG. Embeddings can also be **inverted** to reconstruct images, so they are not automatically private (verify against the literature for your encoder).
+- **On-device draft, cloud verification:** a network round trip per verification step makes this costly unless you verify long chunks per round trip.
+- **Cloud for knowledge, device for personal context:** the cloud handles retrieval and the web, the device keeps personal data local.
+- **Cloud critic:** the cloud checks or corrects an on-device answer in the background (privacy permitting).
+
+**Hedged requests:** when the pre-router is unsure, launch the cloud call in parallel with local inference, and use whichever finishes first or better. This cuts tail latency, but costs radio energy, cloud cost and privacy exposure, so allow it only where policy permits.
+
+## 3. Confidence calibration and uncertainty
+
+**Why raw confidence is unreliable:** instruction-tuned and RLHF'd models are overconfident, quantization shifts logits, small models are more fragile, and domain shift breaks calibration.
+
+**What you need for routing:** mainly **discrimination** (does confidence rank correct above incorrect answers?) plus a good threshold. Perfect probability calibration is secondary.
+
+**Metrics:**
+- **AUROC of confidence for correctness** (ranking quality).
+- **Risk–coverage curve** and its area (AURC): plot error rate among accepted answers vs the fraction accepted.
+- **Selective accuracy** at a fixed coverage.
+- **ECE, Brier score and NLL** for calibration, with reliability diagrams.
+
+**Methods:**
+- **Temperature scaling** per task type on a held-out set.
+- **A confidence model:** logistic regression or gradient-boosted trees on features (min log-prob, entropy, answer length, task type, image quality, OOD score, probe output), with isotonic or Platt calibration on top.
+- **Per-slice calibration** (OCR vs scene Q&A, low light), since calibration varies a lot by slice.
+- **Re-calibrate after every model update and quantization change** (INT4 shifts logits).
+- **Conformal risk control:** choose a threshold that guarantees an error rate of at most ε among accepted answers, assuming exchangeability. Distribution shift breaks the guarantee, so monitor it.
+
+**Labels for training the confidence model:**
+- Gold labels are best but expensive.
+- **Agreement with the cloud model** is a proxy for "matches the stronger model", not for truth. Combine it with LLM-judge scores and human audits.
+- Closed-form tasks (classification, OCR strings) can use exact match.
+
+**Free-form outputs are hard.** Use the confidence of the first tokens or the answer span, claim-level checks, or semantic entropy.
+
+**Dynamic thresholds:** `τ(context)`. For example, a lower deferral rate when offline or on low battery, a higher one on Wi-Fi while charging. A control loop can adjust τ online to hit a **target deferral rate** (a cloud cost budget).
+
+**Production monitoring:** audit calibration on sampled traffic, and track drift in the deferral rate. A small, consented **shadow sample** can measure agreement with the cloud.
+
+## 4. Privacy constraints
+
+### 4.1 Data classes and routes
+
+| Class | Examples | Allowed routes |
+|---|---|---|
+| P0: non-sensitive | Generic scenes, public objects | Any |
+| P1: personal, low sensitivity | Everyday photos without faces or documents | Cloud with consent and redaction |
+| P2: sensitive | Faces, documents, financial or health content, children, home interiors, screens with personal data | **On-device only**, or cloud only with explicit opt-in and redaction |
+| P3: regulated or region-bound | Data-residency rules (GDPR, India's DPDP, Korea's PIPA, verify) | Region-specific endpoints, or on-device |
+
+### 4.2 Design rules
+- **The privacy gate runs before any confidence logic and fails closed.** If the sensitivity classifier is unsure, treat the input as sensitive. Optimize it for **recall**, since a false negative is the worst failure (a leak).
+- **Data minimization:** send only what the cloud needs. Crop to the region of interest, downscale, redact faces and plates, mask text PII (the Q8 pipeline, run on-device), or send a **structured text description** instead of pixels.
+- **Per-category user consent**, a visible indicator when data leaves the device, and enterprise or device-management policy support (verify the specifics for Samsung's management stack).
+- **Cloud side:** encrypted transport, **no retention or short TTL**, no training on user data without consent, attested confidential-computing enclaves (as in Apple's Private Cloud Compute design), and isolation of shared caches (prefix-cache timing channels, Q15).
+- **Prompt injection (Q25):** text in a scene can try to steer a cloud model that has tool access. Sanitize inputs and restrict tool capabilities.
+- **Auditability:** log routing decisions with reason codes, not content.
+- **Router training data:** use only consented or privacy-preserving data (opt-in sampling, on-device labeling, federated analytics).
+
+## 5. Latency SLOs and routing economics
+
+**Latency model:**
+- `T_local = T_enc + T_prefill + n · TPOT_local` (Q12).
+- `T_cloud = T_upload + RTT/handshake + T_queue + T_prefill_cloud + n · TPOT_cloud + T_download`.
+- A **deferred** query costs `T_local_partial + T_cloud`. Expected latency of a cascade: `E[T] = T_local + p_defer · T_cloud`.
+
+**Typical shape:**
+- **Upload is the dominant cost for images.** A 12 MP JPEG can be about 3 MB, so downscale to about 1,024 px (roughly 200 to 300 KB) before sending. At 10 Mbps uplink that is about 0.25 s, at 2 Mbps about 1.2 s.
+- Keep connections warm (HTTP/2 or QUIC, connection reuse) to avoid repeated TLS handshakes.
+- For short answers, local is often faster. For long or hard answers, cloud decode speed can win. For example, 200 tokens at 25 tokens/s locally takes about 8 s, versus perhaps 2 to 3 s end to end in the cloud (assumed).
+
+**Reducing the deferral penalty:**
+- **Decide early.** After prefill, but before decode, check a cheap signal (the probe on hidden states) and defer immediately if it is bad.
+- **Hedged requests** for latency-critical classes where policy allows.
+- **Progressive refinement:** show the local answer first and update it if the cloud answer is materially better. Beware flip-flopping (see section 7).
+
+**Cost and the budget:** cloud cost per query (image tokens and GPU time), a target deferral rate (for example 10 to 20%), and radio and tail energy (Q16).
+
+**Worked example (assumed numbers):** the local model is 80% accurate overall. With good confidence ranking, deferring the 20% least-confident queries leaves 88% accuracy on the 80% answered locally. The cloud is 93% accurate on the deferred 20%.
+- Overall accuracy = `0.8 × 0.88 + 0.2 × 0.93 = 0.89`, against 0.93 for all-cloud.
+- That is about **96% of all-cloud quality at 20% of the cloud cost**, and most queries get a fast local answer.
+
+## 6. Offline fallback and resilience
+- **Detect connectivity quality, not just presence:** passive measurements of recent RTT and throughput, quick probes, and a **circuit breaker** that stops calling the cloud after repeated failures and retries after a cooldown.
+- **Timeouts from the latency budget:** `cloud_timeout = SLO − elapsed`, with a local fallback if the cloud is late.
+- **Graceful offline behaviour:**
+  - The on-device model is a **complete product at its tier**, with clear UX about what works offline.
+  - For a knowledge-heavy query while offline, answer from what is visible with explicit uncertainty, or queue the request for when connectivity returns (async, with a notification).
+  - Cache previous cloud answers (keyed by image hash and question, privacy permitting).
+- **Retries and idempotency:** exponential backoff, idempotency tokens, resumable uploads.
+- **Overload handling:** on rate limits (429) or outages, fall back to local. Support feature flags, a **kill switch** for remote routing, and load shedding.
+
+### Mode matrix
+
+| Mode | Behaviour |
+|---|---|
+| Online, good link | Normal cascade, normal threshold |
+| Online, poor or metered link | Higher confidence needed to defer, smaller payloads, longer timeouts avoided |
+| Offline | On-device only, explicit uncertainty, queue knowledge-heavy requests |
+| Privacy mode | On-device only, no hedging, no logging |
+| Low battery or thermal stress | Prefer the cheaper route by energy (can favour cloud on strong signal, or a smaller local tier), degrade gracefully (Q16) |
+
+## 7. Consistency of behaviour between the two models
+
+**What goes wrong:** different style and level of detail, different output formats or JSON structure, different refusal and safety behaviour, different units and language, different perception (one model reads small text and the other doesn't), contradictory facts across turns after a route switch, different tool-call schemas, and different handling of "I don't know".
+
+**Mitigations:**
+- **One behaviour contract:** the same system prompt and persona, output schema, safety policy, tool interface and language policy. Run a **golden behaviour test suite on both models** (schema validity, style, refusal parity).
+- **Align the models by training:** distill the cloud model's style, formats and safety behaviour into the on-device model (Q10), and share the same input and output guardrails on both paths.
+- **Canonical conversation state in the app:** keep the conversation as text plus structured memory, and pass a compact summary and recent turns on a route change (not KV-cache). Send only the necessary context, for privacy.
+- **Sticky routing with hysteresis:** once a conversation escalates to the cloud, stay there for the session or until the topic changes, so answers don't flip-flop.
+- **Answer reconciliation:** if the cloud answer differs materially from a local answer that was already shown, present it explicitly as an update, and only when the cloud is more confident. Avoid silent contradictions.
+- **Version management:** the on-device model updates slowly and the cloud model updates quickly, so keep a compatibility matrix, canary and A/B tests, and regression tests across model pairs.
+- **Measure it:** agreement rate on a shared evaluation set, format-valid rate, refusal-rate parity, style similarity, and the **flip-flop rate** within sessions. Treat user-visible inconsistencies as bugs.
+
+## 8. Evaluating and rolling out the router
+
+**Offline evaluation:**
+- Build a dataset of (query, image, local answer and features, cloud answer, gold or judge label). Train the router and evaluate the risk–coverage curve, the cost–accuracy Pareto front, and latency under **real network traces** and thermal states.
+- Slice analysis, with the privacy-sensitive slices required to show **zero** leaks.
+- **Off-policy evaluation** (inverse propensity or doubly robust estimators) to evaluate new policies from logs without deploying them.
+
+**Online rollout:** shadow mode (compute decisions without acting), then A/B with guardrail metrics (task success, p95 latency, cloud cost per user, deferral rate, privacy violations = 0, user feedback, timeouts), staged rollout and a kill switch.
+
+**Monitoring:** deferral-rate drift, calibration drift (ECE on audited samples), cloud timeouts and errors, privacy-classifier recall audits, and version-skew dashboards.
+
+**Failure modes:**
+- **Confidently wrong local answers** (silent hallucinations).
+- Over-sending (cost) or under-sending (quality).
+- **Privacy classifier false negatives** (the worst case).
+- Threshold drift after a model update.
+- **Selection bias in router training:** only deferred queries have cloud answers. Keep a small, consented random exploration sample to get unbiased estimates.
+- Adversarial inputs designed to force or avoid cloud routing.
+
+## 9. Sketch of the routing logic
+
+```python
+def route(req, ctx):
+    # 1. hard policy gates (fail closed)
+    if ctx.privacy_mode or sensitivity(req) >= SENSITIVE or not user_consent(req):
+        return LOCAL
+    if not ctx.online or breaker_open():
+        return LOCAL
+    # 2. cheap pre-router
+    pre = pre_router(req.features)               # task type, OOD score, needs_knowledge
+    if pre.needs_knowledge or pre.ood_score > T_OOD:
+        return CLOUD_REDACTED
+    # 3. run local, then decide post-hoc
+    ans, feats = local_vlm(req)                  # logprob stats, entropy, hidden-state probe
+    conf = confidence_model(feats, req.task)     # calibrated P(correct)
+    tau = threshold(ctx)                         # connectivity, battery, cost budget
+    if conf >= tau:
+        return ans
+    # 4. defer, with a timeout derived from the SLO and a local fallback
+    return cloud(redact(req), timeout=ctx.slo - elapsed()) or ans
+```
+
+## 10. Strong interview answer
+> "I treat routing as a constrained decision. Privacy is a hard gate that fails closed, and the rest is utility: quality minus latency, cost and energy penalties. The design is layered. First, policy gates: a sensitivity classifier tuned for recall, user consent, region rules, and offline or privacy mode, which force on-device processing. Second, a cheap pre-router on task type, out-of-distribution score and knowledge need, so queries that clearly need the cloud don't waste local compute. Third, run the on-device VLM and compute a calibrated confidence from token statistics, a probe on hidden states, and grounding checks like whether the answer depends on the image, because token probabilities alone miss confident hallucinations. I'd measure ranking quality with AUROC and the risk–coverage curve, calibrate per task slice, re-calibrate after each model or quantization update, and use conformal-style thresholds. The deferral threshold is dynamic by context, like connectivity, battery and a target deferral-rate budget. On latency, I'd model both paths, compress images to about 300 KB before upload, reuse warm connections, decide early after prefill, and use hedged requests only where policy allows. With assumed numbers, deferring the least-confident 20% could give about 96% of all-cloud accuracy at 20% of the cost. For privacy, I'd minimize what leaves the device: crop, downscale, redact PII, or send a text scene description instead of pixels, since features can be inverted. For offline, I'd use quality-aware connectivity detection, a circuit breaker, timeouts from the SLO, queueing and complete offline behaviour at the on-device tier. For consistency, I'd use one behaviour contract and tests on both models, distill the cloud model's style and safety into the on-device model, keep canonical conversation state in the app, use sticky routing to avoid flip-flopping, and measure agreement and flip-flop rates. I'd roll the router out with shadow mode, off-policy evaluation, A/B guardrails, and a small consented exploration sample to avoid selection bias."
+
+## 11. Follow-up questions to prepare for
+1. Why does discrimination (AUROC) matter more than calibration for routing, and when does calibration still matter?
+2. Why do token probabilities fail for confident hallucinations, and what extra signals fix that?
+3. How would you choose the deferral threshold to hit a cloud cost budget while keeping an accuracy floor?
+4. Why is sending visual features to the cloud not automatically private or bandwidth-efficient?
+5. How would you handle a user conversation that starts local and escalates to the cloud mid-way?
+6. What are the risks of hedged requests, and when would you allow them?
+7. How do you avoid selection bias when training the router from logs where only deferred queries have cloud answers?
+8. How would you build and evaluate the privacy sensitivity gate, and what recall would you require?
+
+---
+
+# Q18: Efficient vision backbones
+
+**Question:** Compare MobileNetV3/V4, EfficientNet, MobileViT, FastViT, EfficientFormer and RepViT, and distilled ViTs (DeiT-Tiny, TinySAM, EdgeSAM). What operators are NPU-friendly (e.g. depthwise convs, GELU or LayerNorm costs, attention quantization)? How do structural re-parameterization and NAS help on a specific target device?
+
+Accuracy and parameter numbers are as reported in the papers at 224 px ImageNet, recalled from memory. Verify before quoting. Latency claims depend on the device and compiler, so treat them as directional.
+
+## 0. The core lesson: FLOPs are not latency
+On a mobile accelerator, latency is set by **data movement, operator support, parallelism and kernel overhead**, not just MAC count. ShuffleNetV2's guidelines state this well:
+- Equal channel widths minimize memory access cost.
+- Excessive group convolution raises memory cost.
+- Fragmented, many-branch structures reduce parallelism.
+- Element-wise ops (activations, adds, concatenations) are **not negligible**.
+
+So a model with 3x fewer FLOPs can be slower on your NPU. The only reliable metric is **measured INT8 latency on the target, compiled with the real toolchain**.
+
+## 1. The families
+
+| Family | Type | Params / ImageNet top-1 (reported) | Key ideas | Edge notes |
+|---|---|---|---|---|
+| **MobileNetV3** | CNN | L: ~5.4M, ~75.2% | Inverted residual + depthwise convs, squeeze-excite (SE), h-swish, NAS (MnasNet/NetAdapt) | Depthwise and SE are awkward on matrix-engine NPUs. Per-tensor PTQ is fragile |
+| **MobileNetV4** | CNN / hybrid | Several sizes | **Universal Inverted Bottleneck (UIB)** that unifies several block variants, **Mobile MQA** attention, NAS, designed with a roofline view to be Pareto-efficient across CPUs, GPUs and accelerators | Explicitly device-agnostic, and the multi-query attention cuts memory traffic (reported large speedup on accelerators, verify) |
+| **EfficientNet** | CNN | B0: ~5.3M, ~77.1% | Compound scaling of depth, width and resolution, MBConv + SE + Swish | **EfficientNet-Lite** removes SE and Swish for edge accelerators and quantization. **EfficientNetV2** adds **Fused-MBConv** in early stages |
+| **MobileViT** | CNN + ViT hybrid | S: ~5.6M, ~78.4% | Local conv, then unfold into patches, a transformer across patches, fold back | `unfold/fold` reshapes and attention make it **slower on-device than its FLOPs suggest**. MobileViTv2 uses linear-complexity separable attention |
+| **EfficientFormer** | Hybrid | L1: ~12.3M, ~79.2% | **Latency-driven design** measured on a phone. Found that large-kernel patchify, LayerNorm and GELU were slow. Uses 4D conv/pool blocks with BN early and attention only in late stages | Reported about 1.6 ms on an iPhone 12 (Core ML) for L1 |
+| **RepViT** | Pure CNN | M1.0: ~6.8M, ~80.0% | Brings ViT-style macro design (separate token and channel mixing, early convs, downsampling) into a MobileNet-like CNN, with **re-parameterized** depthwise convs | Reported about 1 ms on an iPhone 12. No attention to quantize |
+| **FastViT** | Hybrid | T8: ~3.6M, ~76%; SA12: ~11M, ~80% | **RepMixer** (re-parameterizable token mixer without skip connections at inference), large-kernel depthwise convs, train-time overparameterization, attention only in the last stage | Reported 2 to 5x speedups over several baselines at similar accuracy |
+| **MobileOne** | CNN | Several sizes | RepVGG-style structural re-parameterization with many train-time branches | Simple single-path inference graph |
+| **DeiT-Tiny** | Pure ViT | ~5.7M, ~72.2% (higher with distillation) | Standard ViT trained data-efficiently, with a distillation token | Global attention, LayerNorm and GELU in every block, which are costly on NPUs |
+| **TinyViT** | Hybrid | 5M: ~79%, 11M: ~81.5% (with large-data distillation) | Fast pretraining distillation with cached teacher logits | Good for distilled small encoders |
+| **MobileSAM / TinySAM / EdgeSAM** | Distilled segmentation encoders | — | MobileSAM: distills SAM's ViT-H image encoder (~632M) into a TinyViT-5M. TinySAM: online hard-prompt distillation + W8A8 PTQ. **EdgeSAM**: prompt-in-the-loop distillation into a RepViT-based CNN, reported above 30 FPS on an iPhone 14 | Shows how to move heavy ViT capabilities to the edge by distilling into a CNN-friendly backbone |
+| **EfficientViT** (MIT) | Hybrid | Several sizes | ReLU-based **linear attention** with multi-scale depthwise convs | Strong for high-resolution dense tasks. Note: Microsoft's "EfficientViT" with cascaded group attention is a different model |
+
+**Also worth knowing:** FasterNet (partial convolution to cut memory access), ConvNeXt (7×7 depthwise + LayerNorm + GELU, strong but heavy for NPUs), GhostNet, ShuffleNet (shuffle and concat cost memory traffic), and **MobileCLIP** (Apple), whose image encoders are FastViT-style hybrids trained with multimodal reinforced training for language-aligned features.
+
+## 2. Operator-by-operator view of NPU friendliness
+
+| Operator | NPU friendliness | Why and what to do |
+|---|---|---|
+| **1×1 conv / matmul** | Excellent | Dense, high arithmetic intensity, maps straight to the MAC array |
+| **Standard 3×3 conv** | Excellent | Good reuse. **Fused-MBConv** uses it in early stages for that reason |
+| **Depthwise conv (3×3, 5×5)** | Mixed | Each activation is reused only K² times, so it is **memory-bound** and underuses large MAC arrays (some NPUs run it on slower vector units). Fine in later stages with many channels at low resolution. Per-tensor INT8 is fragile because per-channel weight ranges vary a lot (use per-channel weights, equalization, QAT) |
+| **Large-kernel depthwise (7×7)** | Check | May be slow or unsupported on some NPUs. Verify |
+| **ReLU / ReLU6** | Excellent | Cheapest. ReLU6's bounded range helps quantization |
+| **h-swish / h-sigmoid** | Good | Piecewise linear, often supported. Fused support varies |
+| **SiLU / Swish** | Fair | Needs sigmoid and a multiply, or a LUT. More quantization-sensitive |
+| **GELU** | Fair to poor | Erf or tanh approximations, often a LUT or FP16/vector fallback |
+| **Softmax** | Fair | Needs exp, a sum and a divide, usually FP16 or INT16 and memory-bound |
+| **BatchNorm** | Excellent | Folds into the preceding conv at inference, so it costs nothing |
+| **LayerNorm / RMSNorm** | Poor | A reduction per token, not foldable, memory-bound, needs higher precision, and often needs layout transposes. Prefer BN in conv stages and keep LN to a few attention blocks |
+| **Squeeze-excite (SE)** | Poor | Global pooling + FCs + broadcast multiply: a serialization point and memory-bound. EfficientNet-Lite drops it |
+| **Self-attention (MHSA)** | Poor to fair | QKᵀ is N², softmax, AV, plus head reshapes and transposes (layout changes cost DMA). Use only at the lowest-resolution stage |
+| **Window partition / shift, unfold / fold, roll, gather, einsum** | Poor | Often unsupported or CPU fallbacks. Avoid in deployment backbones |
+| **Concat / channel shuffle / split** | Poor to fair | Pure memory copies |
+| **Skip connections** | Fair | Need the activation kept in memory. RepMixer-style designs remove them at inference |
+| **Resize (bilinear)** | Fair | Usually supported. Bicubic often is not (precompute offline, Q3) |
+
+**Layout and shape rules:** many NPUs prefer **NHWC** with channel counts a multiple of 8, 16 or 32, a limited tensor rank (often ≤4), and supported kernel and stride combinations. Pick channel widths and resolutions accordingly. A width multiplier that produces odd channel counts wastes MAC lanes.
+
+**Quantization notes (Q11):**
+- Depthwise-heavy CNNs need per-channel weight quantization and often QAT or equalization.
+- LayerNorm and softmax outliers hurt attention-based backbones.
+- **Attention quantization:** keep softmax and LayerNorm in FP16 or INT16, use W8A8 for the projections, and watch for long-tailed post-softmax distributions.
+- Re-parameterized kernels can be hard to quantize (section 3).
+
+## 3. Structural re-parameterization
+
+**Idea:** train with a rich multi-branch structure, then **merge the branches into a single operator** for inference. The inference model is a plain single-path network.
+
+**RepVGG-style recipe (3×3 + 1×1 + identity, each with BN):**
+1. Fold each BN into its conv: `W' = W·γ/√(σ² + ε)`, `b' = β − μ·γ/√(σ² + ε)`.
+2. Pad the 1×1 kernel to 3×3, and express the identity as a 3×3 kernel (a 1 at the center per channel).
+3. Sum the kernels and the biases. The result is one 3×3 conv with the same function.
+
+**Why it helps on-device:**
+- Fewer memory accesses, no skip-connection activations to keep, fewer kernel launches, and a graph that compilers fuse well.
+- You keep the **accuracy benefit of train-time capacity** with inference-time simplicity (RepVGG, MobileOne, RepViT, FastViT's RepMixer, and RepLKNet-style large kernels made from parallel small kernels).
+
+**Caveats:**
+- **Quantization:** the fused kernel can have a very different weight and activation distribution, and PTQ on a re-parameterized model can degrade a lot (the known RepVGG quantization problem, addressed by approaches like RepOpt or QAT). Plan QAT.
+- **Training cost:** multi-branch training uses more compute and memory.
+- **Exactness:** do the fusion in FP32 and in eval mode, and check numeric equivalence (for example max error around 1e-5) before export. Fusing in FP16 can lose precision.
+- Fusion must happen **before** export, and it only works across linear operations.
+
+## 4. NAS and hardware-aware design for a specific target
+
+**What hardware-aware search does:**
+- **MnasNet:** the search reward includes **measured latency on a phone**, roughly `ACC × (LAT/T)^w`.
+- **FBNet:** differentiable NAS with a **latency lookup table**.
+- **ProxylessNAS:** showed that the best architecture differs for GPU, CPU and mobile.
+- **Once-for-All:** train one supernet, then specialize subnets for many devices with a latency predictor.
+- **MobileNetV3:** NAS plus NetAdapt layer-wise tuning.
+- **MobileNetV4:** designs with a roofline view of hardware (the ridge point) to find architectures that are efficient across many devices.
+- Latency predictors: nn-Meter, HELP (meta-learned predictors).
+
+**A practical workflow for your target NPU:**
+1. **Characterize the device** with the real compile stack (QNN, ENN, ExecuTorch delegate, and so on). Micro-benchmark every op type across shapes (convs, depthwise, 1×1, matmul, LayerNorm, softmax, GELU, resize) in **INT8**, to build a latency table and a roofline (peak compute vs bandwidth).
+2. **Define the search space** using only supported ops, hardware-aligned channels, a limited attention placement, fixed-shape buckets and a bounded number of tokens for the LLM (Q2).
+3. **Multi-objective search:** maximize accuracy (supernet or zero-cost proxies) subject to latency ≤ T, memory and energy on the target. Remember that per-op latency tables are not perfectly additive (fusion and layout effects), so validate with real compiles, or use a predictor trained on device measurements.
+4. **Train the winner** with distillation from a large teacher, then QAT.
+5. **Re-search when the hardware or compiler changes.** Results are device- and compiler-version-specific. An architecture tuned for one NPU may be suboptimal on another, which matters for a multi-vendor product (Q13).
+
+**Beyond architecture:** the resolution, width multiplier and depth are also knobs, and they tie directly to the token budget (Q2).
+
+## 5. Relevance to small VLMs
+- **A flat ViT patchify (stride 14 or 16) makes many tokens.** Hierarchical **conv or hybrid encoders downsample progressively** (stride 32 or 64), so they can run at high resolution and output **far fewer tokens** to the LLM. Apple's FastVLM, for example, uses a hybrid FastViT-style encoder (FastViTHD) with a large output stride, reporting large time-to-first-token improvements at high resolution (verify the numbers). This attacks the visual-token explosion (Q2) at the encoder, not only in the projector.
+- **Language-aligned pretraining matters:** the encoder must produce features the LLM can use. MobileCLIP-style multimodal reinforced training, or distillation from a big SigLIP-like encoder (Q10), is how small hybrid encoders get there. ImageNet top-1 alone does not predict VLM quality (Q4).
+- **Dense tasks share the backbone:** RepViT-SAM and EfficientViT-SAM show that one efficient backbone can serve segmentation and detection (Q19).
+- **Evaluate with a plug-in test (Q4):** plug each candidate into a small VLM alignment run and compare on TextVQA, DocVQA and OCR tasks. OCR needs fine features, so a very large stride can hurt text detail unless the input resolution is raised (verify per model).
+
+## 6. NPU-friendly backbone checklist
+1. Prefer **1×1 and 3×3 standard convs and matmuls**. Use **Fused-MBConv** in early high-resolution stages and depthwise (MBConv) in late low-resolution, high-channel stages.
+2. Use **BN in conv stages** (foldable), and LayerNorm in only a few attention blocks.
+3. Prefer **ReLU, ReLU6 or h-swish** over GELU and SiLU when accuracy allows. Avoid or replace SE blocks.
+4. Put **attention only at the lowest-resolution stage**, and consider MQA or ReLU linear attention. Avoid window shifts, unfold/fold, roll, gather and einsum.
+5. **Re-parameterize** to a single-path inference graph, and plan QAT.
+6. Use **hardware-aligned channel counts** (multiples of 8/16/32) and fixed shape buckets.
+7. Use **bounded activations and per-channel weights** for quantization.
+8. **Downsample progressively** so the LLM gets few tokens.
+9. Check the **compiler's partition report early** and aim for zero CPU fallbacks.
+10. **Measure INT8 latency on the device**, not FLOPs.
+
+## 7. Strong interview answer
+> "On an NPU, FLOPs don't predict latency, because memory movement, operator support and parallelism do, so I benchmark INT8 latency on the target with the real compiler. Among the families, MobileNetV3 and EfficientNet rely on depthwise convs and SE, which are memory-bound and under-use matrix engines, and EfficientNet-Lite and Fused-MBConv fix that. MobileViT looks cheap in FLOPs but unfold/fold and attention make it slow. EfficientFormer was designed by measuring latency on a phone and found large-kernel patchify, LayerNorm and GELU to be slow, so it uses BN and conv or pooling early and attention only at the end. FastViT and RepViT use structural re-parameterization to get a plain single-path inference graph, and MobileNetV4 designs for many devices with UIB and mobile multi-query attention. DeiT-Tiny is a pure ViT with LayerNorm, GELU and global attention everywhere, which is costly on NPUs. TinyViT, MobileSAM, TinySAM and EdgeSAM show how to distill heavy ViTs into edge-friendly backbones. NPU-friendly ops are 1×1 and 3×3 convs and matmuls, ReLU or h-swish, and foldable BN. Costly ones are LayerNorm, GELU, softmax, SE, window attention and reshape-heavy ops. For attention quantization, I'd keep softmax and LayerNorm in higher precision. Re-parameterization merges multi-branch training structures into one conv for faster inference with accuracy kept, but it makes PTQ harder, so I'd plan QAT. Hardware-aware NAS, like MnasNet, FBNet and Once-for-All, puts measured device latency into the objective, but results are device- and compiler-specific, so I'd build an op-level latency table for the target, search within supported ops and aligned channel counts, validate with real compiles, then distill and QAT. For small VLMs, hierarchical hybrid encoders with a large output stride, like the FastViTHD approach, also cut visual tokens at the source, and I'd pick the encoder with a plug-in test on OCR and VQA, not ImageNet accuracy."
+
+## 8. Follow-up questions to prepare for
+1. Why are depthwise convolutions slow on matrix-engine NPUs despite having few FLOPs?
+2. Why did EfficientNetV2 use Fused-MBConv in early stages and MBConv later?
+3. Derive how a RepVGG block's three branches merge into one 3×3 conv. Why is the result hard to quantize?
+4. Why can LayerNorm be expensive on an NPU, and how do BN-based hybrids avoid it?
+5. How does ReLU linear attention (EfficientViT) achieve O(N) attention, and what does it give up?
+6. What is the trade-off between per-op latency lookup tables and a latency predictor for NAS?
+7. How does a conv encoder with stride 64 reduce visual tokens, and what risks does it carry for OCR?
+8. How would you build a MobileSAM-style distillation of a large vision encoder for your VLM?
+
+---
+
+# Q19: Dense perception on-device
+
+**Question:** How would you deploy open-vocabulary detection or segmentation (Grounding-DINO, OWL-ViT, YOLO-World, SAM-lite, CLIPSeg) on-device? Cover real-time constraints, tracking-by-detection and keeping temporal consistency across frames. How do you combine these with a VLM for grounded reasoning (box or point outputs, visual prompts)?
+
+Model facts (sizes, speeds, reported numbers) are from memory of the papers and project pages. Latency figures in budgets are illustrative assumptions. Verify specifics before quoting them.
+
+## 0. The core design principle
+Don't deploy the heavy, universal model. Deploy a **composed pipeline of right-sized models** that runs at different rates:
+- A cheap detector and tracker run continuously.
+- A SAM-lite segmenter runs on demand.
+- The VLM runs only on user queries or events.
+
+The key tricks are **caching or baking in text embeddings** (so the text encoder is not in the loop), **"ground once, then track"**, and **open-vocabulary at training time, closed-set at deploy time**.
+
+## 1. The model families and how deployable they are
+
+### 1.1 Open-vocabulary detection
+
+| Model | Architecture | Text handling | On-device verdict |
+|---|---|---|---|
+| **OWL-ViT / OWLv2** | CLIP-style ViT, each output patch token predicts a box and a class embedding. Classification = dot product with text embeddings | Text and image are **decoupled**, so text embeddings can be precomputed and cached. Also supports image-conditioned (query-by-example) detection | Practical if the ViT is affordable. High resolution (e.g. 960 px, thousands of tokens) is heavy. ViT ops (LayerNorm, GELU, attention) are NPU-costly (Q18) |
+| **Grounding DINO** | DETR-style detector (Swin backbone), a BERT text encoder, **cross-modality feature enhancer**, language-guided query selection, cross-modality decoder | Image features depend on the text prompt (fusion inside the encoder), so nothing about the image can be cached across prompts | **Hard to deploy:** heavy, **multi-scale deformable attention** (a gather-based custom op, poorly supported on NPUs). Use in the cloud or offline as an annotator. Lighter "edge" variants have been released (reported real-time-class on Jetson-level hardware, verify) |
+| **YOLO-World** | YOLOv8-style CNN backbone + **RepVL-PAN** (vision-language path aggregation) with a region-text contrastive loss | **"Prompt-then-detect":** compute text embeddings offline and **re-parameterize them into the head weights**, so inference is a plain YOLO with no text encoder | **Best fit.** Standard NPU ops (convs, upsample, concat), small sizes (S/M/L), reported real-time speeds on a server GPU |
+| **Florence-2** (0.23B/0.77B) | Seq2seq VLM with a DaViT encoder. Boxes and masks as location tokens | Prompted by text | Small enough for on-device, flexible (detection, grounding, captioning, segmentation), but slow for many objects (see section 2D) |
+| **VLM-native grounding** (PaliGemma, Qwen2.5-VL, Molmo) | The VLM outputs boxes or points as text or special tokens | Prompted by text | Flexible, good on complex referring expressions, but autoregressive and slow |
+
+### 1.2 Segmentation
+
+| Model | Idea | Notes |
+|---|---|---|
+| **SAM** | Heavy ViT-H image encoder (~632M), light prompt encoder and mask decoder (a few M parameters). The encoder runs **once per image**, and the decoder runs **per prompt** (box or point) in milliseconds | The split design (amortized encoder, interactive decoder) is ideal for on-device |
+| **MobileSAM, EdgeSAM, TinySAM, EfficientSAM, EfficientViT-SAM** | Distilled SAM encoders (TinyViT, RepViT, EfficientViT) | EdgeSAM is reported above 30 FPS on an iPhone 14 (Q18). Typically INT8-friendly |
+| **SAM 2 and edge variants** | Streaming video segmentation with a memory bank. EdgeTAM is an on-device variant (reported around 16 FPS on a recent iPhone, verify) | Handles temporal consistency natively |
+| **CLIPSeg** | Frozen CLIP ViT-B/16 + a small decoder conditioned on a text or image prompt, producing a coarse mask | Cheap and zero-shot, but low-resolution masks with blurry boundaries. Good for rough regions of interest |
+| **Other open-vocab segmentation** | MaskCLIP (training-free dense CLIP features), SAN, CAT-Seg, SEEM, FC-CLIP | Mostly research-grade for edge |
+
+## 2. Deployment decisions
+
+### 2A. Detection: choose by how dynamic the vocabulary must be
+
+| Need | Choice |
+|---|---|
+| Fixed set of 100 to 1,000 domain classes (home objects, appliances), real-time | **YOLO-World-style, vocabulary baked in** (OTA updates ship only new head weights, tiny) |
+| Vocabulary changes at runtime but uses cached embeddings | Detector head takes text embeddings as input (non-re-parameterized mode), so a new prompt costs one text-encoder pass (CLIP text encoder ~63M, can run on-demand on CPU or NPU) plus a matmul |
+| Truly free-form queries and complex relations | VLM-native grounding, on demand, or the cloud |
+| High-quality open-vocab labels for your domain | **Grounding DINO + SAM as an offline annotator** (Q8), then **distill into a small closed-set detector** |
+
+### 2B. The vocabulary-size problem
+Open-vocab heads compute a score for every anchor and every class. With 8,400 anchors × 1,000 classes that is 8.4M scores per frame, which makes the head and the NMS expensive.
+- **Restrict the vocabulary by context** (scene-conditioned: kitchen classes in a kitchen), or use a hierarchical vocabulary.
+- Pre-filter to a top-K of candidate boxes before class scoring.
+- Use mixed precision for the head (the cosine-similarity logits are quantization-sensitive, Q11).
+
+### 2C. Segmentation: detector → box prompt → SAM-lite
+- Run the SAM-lite **encoder** at a low rate (keyframes, or on demand) and cache the image embedding (e.g. 256×64×64 FP16 ≈ 2 MB).
+- Run the **decoder** per prompt, batching all boxes from the detector together. A few ms.
+- Resize and threshold the mask logits on the GPU or in the graph. Mask post-processing (upsampling, argmax, RLE or polygon conversion) is a hidden cost.
+- Export notes: SAM-lite encoders use a fixed input size. The decoder has a variable number of prompts, so export fixed buckets (e.g. 1, 4, 8 prompts, padded) (Q13).
+
+### 2D. Why VLM-native grounding is not for continuous use
+Boxes are text tokens, about 4 to 8 tokens per box, so a scene with 10 objects can need about 200 output tokens. At 25 tokens/s that is about **8 seconds** (Q12). Use it for **on-demand** queries, then hand off to a tracker.
+
+### 2E. Export and compiler gotchas
+- Deformable attention (Grounding DINO) needs a `grid_sample`-style rewrite, which NPUs handle poorly.
+- NMS is dynamic and data-dependent. Keep it **outside the NPU graph** (on the CPU), or use an NMS-free head or fixed top-K selection in-graph.
+- Verify the op coverage report for every model early (zero CPU fallbacks in the hot path).
+
+## 3. Real-time constraints
+- **Frame budget:** 30 FPS gives about 33 ms per frame for the continuous path (preprocess + detect + postprocess + track + render).
+- **Hierarchical rates** (the central idea):
+  - Tracker at the camera rate (30 Hz).
+  - Detector at 5 to 10 Hz, or event-triggered.
+  - SAM-lite encoder at 2 to 5 Hz, or on demand.
+  - VLM on a user query or every N seconds with an object list.
+- **Latency vs throughput:** pipelining (ISP/GPU preprocess, NPU inference, CPU postprocess) raises throughput but latency is still the sum. AR overlays and robot control need end-to-end latency, not only FPS.
+- **Resolution vs small objects:** use ROI crops predicted by the tracker, or tile at a lower rate, or adapt resolution to the scene.
+- **Frame handling:** zero-copy YUV into the model, sensor timestamps, and "latest frame wins" queues so stale frames are dropped (Q15).
+- **Memory (Q14):** detector tens of MB, SAM-lite encoder and decoder tens of MB, text encoder 30 to 60 MB INT8 (load on demand), plus the VLM (~1.1 GB).
+- **Energy and thermal (Q16):** continuous detection costs power. Use event triggers, adaptive frame rate and ROI processing.
+
+**Illustrative continuous-path budget:**
+
+| Step | Time |
+|---|---|
+| Preprocess | ~3 ms |
+| Detector (small YOLO-World, INT8, 640 px, on NPU) | ~15 ms |
+| Postprocess + NMS | ~3 ms |
+| Tracker | ~2 ms |
+| Render / overlay | ~5 ms |
+| **Total** | **~28 ms (about 30 FPS)** |
+
+SAM-lite encoder (tens of ms) and the VLM stay **off** the per-frame path.
+
+## 4. Tracking-by-detection and temporal consistency
+
+### 4.1 Tracking algorithms
+- **SORT:** a Kalman filter (constant-velocity box state) plus Hungarian assignment on IoU. Very cheap.
+- **DeepSORT:** adds an appearance embedding (ReID network) and cascade matching.
+- **ByteTrack:** a second association pass that also uses **low-confidence** detections, recovering occluded objects. No appearance model, very cheap, and popular for edge.
+- **OC-SORT:** observation-centric, better with non-linear motion and occlusion.
+- **BoT-SORT / StrongSORT:** camera-motion compensation and ReID.
+- Kalman filters and the Hungarian algorithm are CPU operations on tens of objects, which is negligible.
+
+### 4.2 Open-vocabulary specific problems
+- **Label flicker:** text similarity scores hover near thresholds, so a "cup" becomes a "mug" or a "glass" from frame to frame.
+- **Fixes:**
+  - Aggregate class scores **per track** (running average or majority vote with hysteresis).
+  - Average the **region embedding** over frames and compare that to text.
+  - Use a high threshold to start a track and a lower one to keep it.
+  - Decide the label after N frames.
+
+### 4.3 Temporal consistency for masks
+- **SAM 2-style memory** for streaming propagation, or per-frame SAM with flow-based warping.
+- **Keyframes + propagation:** run the heavy model at keyframes. Propagate between them with a light method: optical flow (a small learned model or classical Lucas–Kanade), template trackers, or video-encoder motion vectors where the hardware exposes them (verify).
+- **Smooth the outputs:** exponential moving average on mask logits, temporal median, and mask-IoU association.
+- **Ego-motion compensation:** use the IMU to warp prior boxes during camera motion (Q20, Q21).
+- **Re-detection and re-ID:** periodically re-prompt SAM with detector boxes, and re-identify objects after occlusion using appearance embeddings (DINO or CLIP crop embeddings).
+- **Adaptive keyframes:** trigger the detector when tracker confidence drops, a new object enters (frame differencing), or the IMU shows large motion. Otherwise skip.
+
+### 4.4 Metrics and failure modes
+- **Metrics:** MOTA, IDF1, **HOTA** (more balanced), ID switches, fragmentation, plus a **flicker rate** (how often object presence toggles) and temporal mask-IoU stability.
+- **Failure modes:** motion blur, rolling shutter, low light, occlusion, two identical objects (two chairs), objects leaving and re-entering, fast robot turns causing track loss.
+- **Identity persistence matters downstream:** "the red cup" in the VLM context should refer to a stable track ID.
+
+## 5. Combining with a VLM for grounded reasoning
+
+### 5.1 Patterns
+
+1. **Perception as structured context for the VLM.**
+   - The on-device detector produces a compact scene description, for example `[{id, label, box, mask_area, depth, state}]`, which is added to the prompt alongside the image.
+   - The VLM then reasons over objects ("which object is closest to the door?").
+   - Because the object list is grounded, this reduces hallucination (Q9).
+   - Token cost: about 20 objects × 25 tokens ≈ 500 tokens, similar to the image tokens, so balance the two (fewer visual tokens plus an object list).
+   - **Set-of-Mark prompting:** overlay numbered masks on the image (from SAM) so the VLM can refer to "object 5". It helps small VLMs, but needs readable marks at the encoder's resolution.
+
+2. **VLM as grounder, then segmenter and tracker ("ground once, track continuously").**
+   - The VLM outputs boxes or points for a complex referring expression ("the mug left of the laptop that is not blue").
+   - Those become SAM-lite prompts, and the resulting mask goes to the tracker.
+   - The VLM re-grounds only on demand.
+   - Output formats: location tokens (Florence-2, PaliGemma), JSON absolute coordinates (Qwen2.5-VL), points (Molmo).
+
+3. **Region-conditioned VLM (visual prompts).**
+   - **Crop-and-zoom:** use a detector box to crop the region at high resolution and feed the crop plus a global thumbnail. This spends tokens only where needed (Q2) and helps small objects and OCR.
+   - **Drawn visual prompts:** boxes, arrows or circles overlaid on the image (ViP-LLaVA).
+   - **Region features as tokens:** RoI-aligned features fed into the LLM (Ferret, GPT4RoI, Osprey style).
+   - **Tap-to-ask UX:** the user taps a point, SAM-lite gives a mask, and the VLM answers about that region.
+
+4. **Agentic loop with perception tools.**
+   - The VLM requests tools ("detect cups", "segment object 3", "zoom into region X"), the on-device orchestrator executes them, and the VLM iterates.
+   - Each call adds detector time plus a re-prefill for new crop tokens, so cap the number of steps.
+
+5. **Verification.**
+   - Check VLM claims against the detector ("there is a cat" → open-vocab score), to reduce object hallucination (Q9) and to feed uncertainty into routing and abstention (Q17).
+
+6. **Add geometry from other sensors.**
+   - Attach depth or LiDAR to each mask (for example the median depth inside the mask), project to 3D using the intrinsics, and give the VLM or planner metric positions ("how far is the cup?") (Q20, Q21).
+
+### 5.2 Coordinate-frame bugs (a major source of errors)
+The VLM sees a **resized, letterboxed, tiled or cropped** input, and its coordinates are relative to that input, in a normalized (for example 0 to 1000) or absolute-pixel format.
+- Keep **explicit transform matrices** to map between the original frame, the model input, tiles and crops. For tiles, outputs are per-tile with offsets.
+- Dynamic-resolution models (Qwen2-VL style) output absolute coordinates in the resized image.
+- Unit-test with synthetic images that have known boxes, and check round trips for every preprocessing path.
+
+### 5.3 Training and data
+- Add grounding data (boxes in text) when fine-tuning the VLM (Q9), and choose one coordinate convention across the VLM and the detector.
+- Auto-label domain data with Grounding DINO + SAM (Q8), then distill into the small detector and into the VLM's grounding skill.
+
+## 6. Pipeline sketch
+
+```python
+def run_frame(frame, state):
+    t = tracker.update(frame)                          # every frame, ~2 ms (flow / Kalman / ByteTrack)
+    if state.need_detect(t):                           # every ~3rd frame, or tracker confidence drop, new motion, IMU jolt
+        dets = detector(frame, vocab=state.vocab)      # baked or cached text embeddings
+        tracks = associate(t, dets)                    # ByteTrack-style, class scores smoothed per track
+    if state.need_masks(tracks):                       # on demand, keyframes only
+        emb = sam_encoder(frame)                       # cached 2 MB embedding
+        masks = sam_decoder(emb, boxes=[tr.box for tr in tracks])
+    if state.user_query:                               # on-demand, off the per-frame path
+        ctx = scene_json(tracks, masks, depth)         # grounded, compact
+        answer, new_boxes = vlm(frame_or_crops, ctx, state.user_query)
+        tracker.seed(map_to_frame(new_boxes))          # ground once, then track
+    return tracks, masks
+```
+
+## 7. Evaluation
+- **Open-vocab detection:** LVIS AP (especially rare classes) and COCO zero-shot, plus **domain AP per class**, small-object AP, and **false positives per image** (for safety-relevant classes like "person").
+- **Runtime:** FPS, p95 frame time, energy per frame, thermal behaviour (Q16).
+- **Tracking:** HOTA, IDF1, ID switches, flicker rate on **domain video** (home scenes, egocentric motion).
+- **Segmentation:** mIoU and boundary F-score.
+- **End to end:** grounded VQA accuracy **with vs without** the detector context, hallucination rate (POPE, Q9), and coordinate-mapping unit tests.
+- **Slices:** low light, clutter, small objects, fast motion.
+
+## 8. Strong interview answer
+> "I'd deploy a composed pipeline, not one big model, with different components at different rates. For open-vocabulary detection, Grounding DINO is too heavy for edge: its image features depend on the text prompt and it uses deformable attention, a gather-based op NPUs handle badly. I'd use it offline as an annotator, together with SAM, and distill into a small closed-set detector. YOLO-World's prompt-then-detect design is the best on-device fit: text embeddings are computed offline and re-parameterized into the head, so inference is a plain CNN, and a vocabulary update ships as a tiny head-weights OTA. OWL-ViT also decouples text, so embeddings can be cached, but its ViT is costly at high resolution. I'd restrict vocabulary by scene context to avoid huge class-score tensors, keep NMS outside the NPU graph, and use mixed precision for the head. For masks, I'd run a SAM-lite encoder like EdgeSAM or MobileSAM at a low rate and cache the embedding, with the light decoder per box prompt batched. For real time, I'd split rates: tracker at 30 Hz, detector at 5 to 10 Hz or event-triggered, SAM encoder on demand, VLM on query. Tracking is ByteTrack or OC-SORT, with per-track class-score smoothing and hysteresis to stop open-vocabulary label flicker, SAM 2-style memory or flow-based propagation for masks, IMU ego-motion compensation, and periodic re-prompting. I'd measure with HOTA, IDF1 and a flicker rate. To combine with the VLM, I'd use four patterns: structured object lists as grounded context, Set-of-Mark prompts, 'ground once, then track', where the VLM emits boxes or points on demand that go to SAM and the tracker, and region crops or visual prompts for small objects. I'd also verify VLM claims with the detector. The big engineering risk is coordinate-frame mapping across resizing, letterboxing, tiling and crops, so I'd keep explicit transforms and test them with synthetic known-box images. VLM-native grounding is too slow for continuous use, since boxes cost many tokens and decode is bandwidth-bound."
+
+## 9. Follow-up questions to prepare for
+1. Why can YOLO-World re-parameterize the text embeddings into the head, and what does that cost in flexibility?
+2. Why is Grounding DINO hard to deploy on an NPU, and what is the better use of it?
+3. Why does SAM's encoder/decoder split fit on-device use, and how would you batch several box prompts?
+4. How would you stop an open-vocabulary detector's labels from flickering across frames?
+5. What triggers would you use to decide when to run the detector instead of the tracker?
+6. Why is VLM-native grounding too slow for continuous detection, and how does "ground once, then track" fix that?
+7. What are the common coordinate-mapping bugs between a tiled VLM input and the original frame?
+8. How would you use depth or LiDAR to give a VLM metric positions of masked objects?
+
+---
+
+# Q20: Multimodal sensor fusion (RGB, depth, LiDAR, IMU)
+
+**Question:** You have RGB, depth, LiDAR and IMU. Compare early, mid and late fusion. How would you feed depth or point clouds into a VLM (depth as a pseudo-image, 3D tokens like 3D-LLM / PointLLM / LLaVA-3D, BEV features)? Cover time synchronization, calibration (intrinsics, extrinsics, camera-LiDAR, camera-IMU), missing or degraded sensors and sensor dropout during training.
+
+Paper and benchmark details are from memory (3D-LLM, PointLLM, LLaVA-3D, SpatialVLM, SpatialRGPT, ImageBind, BEVFusion, MetaBEV, Kalibr, VSI-Bench and others). Error numbers in the worked tables are simple geometry. Verify specifics before quoting them.
+
+## 0. What each sensor brings
+
+| Sensor | Gives | Weaknesses |
+|---|---|---|
+| **RGB camera** | Semantics, texture, color, text, high resolution | No metric scale, depends on lighting, motion blur |
+| **Depth (ToF, stereo, structured light, or monocular-estimated)** | Metric (or relative) geometry per pixel | Low resolution (ToF), holes on glass, black or shiny surfaces, sunlight interference for IR sensors, range limits. Monocular depth has scale ambiguity |
+| **LiDAR** | Accurate sparse 3D points, long range, lighting-independent | Sparse, no color or texture, noisy on glass and dark surfaces, motion distortion in spinning units |
+| **IMU (accelerometer + gyroscope, 100 to 1,000 Hz)** | Orientation, gravity direction, short-term motion | Drift and bias, no appearance, needs integration or fusion |
+
+They are complementary: RGB says **what**, depth and LiDAR say **where and how far**, IMU says **how the sensor moved**.
+
+## 1. Early, mid and late fusion
+
+| Level | What is fused | Examples | Pros | Cons |
+|---|---|---|---|---|
+| **Early (input or data level)** | Raw or low-level data combined before feature extraction | RGB-D as a 4-channel input, projecting LiDAR points into the image as a sparse depth channel, **PointPainting** (append image segmentation scores to LiDAR points) | One backbone, cheap, allows low-level cross-modal cues | Needs precise calibration and sync, breaks pretrained RGB encoders (the first conv expects 3 channels), modalities have different statistics, a failed sensor corrupts the input |
+| **Mid (feature level)** | Per-modality encoders, then fused features or tokens (concat, sum, cross-attention, shared BEV space) | **BEVFusion** (camera and LiDAR features fused in BEV), TransFusion, FUTR3D | Usually the best accuracy, reuses pretrained per-modality encoders, handles different resolutions, supports modality gating and dropout | More compute (several encoders), needs a shared representation, more complex training |
+| **Late (decision level)** | Per-modality models output detections or predictions, merged afterwards (NMS merge, Kalman or Bayesian fusion, voting, learned late fusion) | Detector per sensor + tracker | Modular, robust to a failed sensor, easy to synchronize asynchronous sensors, each model validated separately | Loses cross-modal cues, correlated errors, confidences must be calibrated across modalities |
+
+**Mapping to a VLM (the three practical routes):**
+1. **Pseudo-image route (early):** convert depth to an image and reuse the VLM's existing vision encoder.
+2. **Token route (mid):** add a modality-specific encoder + projector and append the resulting tokens to the LLM input.
+3. **Symbolic route (late):** convert sensor data into structured text (objects with metric positions, distances, motion state) and put it in the prompt.
+
+## 2. Feeding non-RGB data into a VLM
+
+### 2.1 Depth as a pseudo-image
+- Render depth as a 3-channel image: a colormap (e.g. Turbo), a normalized grayscale replicated across channels, or **HHA encoding** (horizontal disparity, height above ground, angle with gravity).
+- **Pros:** no new architecture, cheap, works with the existing encoder after fine-tuning.
+- **Cons:**
+  - 8-bit quantization and per-image normalization lose **metric precision**. Use a fixed range (e.g. 0 to 10 m mapped to 0 to 255) or a log scale.
+  - Pretrained encoders have rarely seen colormapped depth, so it needs alignment data.
+  - Depth-to-3D needs the **intrinsics**, so provide the focal length or normalize with it.
+- **Related work:** SpatialVLM (builds metric spatial QA data using estimated depth, then trains a VLM that needs no depth at inference), SpatialRGPT (a depth plugin giving region-level relative depth), SpatialBot (RGB-D inputs). Verify details.
+- **A separate depth encoder + projector** (mid-level) is the alternative: a small CNN or ViT whose tokens are appended or fused. It costs extra tokens (Q2), so budget them (e.g. 64 depth tokens next to ~320 RGB tokens), or fuse them into the RGB tokens with a small resampler.
+
+### 2.2 Metric depth sources on-device
+- **Hardware depth** (ToF, LiDAR): metric but low-resolution and sparse. Upsample or complete it with RGB guidance.
+- **Monocular depth network** (Depth Anything V2-Small class, about 25M parameters): dense, but usually **relative** (scale and shift unknown). Metric variants (Metric3D, UniDepth, ZoeDepth, Depth Pro) exist but are heavier or intrinsics-dependent.
+- **A strong on-device combination:** a dense relative-depth network plus **sparse metric points** (ToF or LiDAR). Fit a per-frame scale and shift (robust least squares or RANSAC), which gives **dense metric depth**.
+
+### 2.3 Point clouds as 3D tokens
+- **Point-based encoders** (PointNet++, Point-BERT, Point-MAE, Point Transformer v3, CLIP-aligned 3D encoders like ULIP-2, OpenShape and Uni3D) produce a set of tokens (say 512), which an MLP projector maps into the LLM.
+  - **PointLLM** (object-level) follows this recipe with point-text data from Objaverse.
+- **Lifting 2D features into 3D** (3D-LLM and successors): extract features from multi-view images with a strong 2D model and aggregate them onto 3D points. This leverages strong 2D pretraining and avoids scarce 3D-text data.
+- **LLaVA-3D** (as I recall): adds **3D position embeddings** (from depth and camera poses) to the 2D patch tokens of multi-view images, so the model becomes 3D-aware **without extra tokens or a separate point encoder**. Video-3D-LLM and Chat-Scene (object-centric tokens with object IDs) are related designs.
+- **Design choices:** object-level vs scene-level; point encoder vs 2D lifting; token budget (farthest-point sampling and voxel downsampling, grouping k-nearest points into patch tokens); 3D positional encoding (Fourier or MLP on xyz); a **gravity-aligned frame** (from the IMU) so "up" is consistent; **keep metric scale** (don't normalize clouds to a unit sphere if you need distances).
+- **On-device issues:**
+  - Mobile ToF and LiDAR clouds are small (hundreds to about 20k points per frame).
+  - PointNet++-style ops (farthest-point sampling, ball query, kNN gather) are poorly supported on NPUs (Q13, Q18). Prefer **voxel or pillar encoders that produce a 2D pseudo-image** (PointPillars) or **range-image CNNs** for spinning LiDAR.
+  - Sparse 3D convolutions are also poorly supported on NPUs.
+
+### 2.4 BEV (bird's-eye-view) features
+- Lift RGB to BEV (Lift-Splat-Shoot, BEVFormer, or inverse perspective mapping on a ground plane), turn LiDAR into BEV (pillars or voxels), and fuse in BEV. The BEV map `[C, H, W]` is patchified into tokens (pooled to about 64) and projected into the LLM.
+- **Pros:** metric, ego-centric, natural for navigation and planning, and a shared space for all sensors.
+- **Cons:**
+  - The ground-plane assumption is weak indoors, where objects sit at different heights. Use multi-layer BEV, an occupancy or voxel grid.
+  - View transforms (deformable attention, scatter/cumsum splatting) are NPU-unfriendly. With a fixed calibration you can precompute the mapping as a lookup table.
+- **Fit:** a home robot needs it for navigation, while a phone camera usually doesn't.
+
+### 2.5 Symbolic (late) route
+- Provide structured text: object list with 3D positions and sizes, room layout, distances, and motion state ("robot moving 0.3 m/s", "device rotating"). Few tokens, interpretable, and robust.
+- **Caveat:** LLMs are weaker at numeric reasoning, so use quantized coordinate bins or pre-compute the answers (e.g. nearest-object distance) in code, and let the VLM explain.
+
+### 2.6 IMU
+- Raw IMU rarely goes into the VLM as tokens. Options: a small 1D-CNN or transformer encoder aligned to the other modalities (IMU2CLIP, ImageBind includes IMU), or, more commonly, use the IMU to:
+  1. provide **gravity direction and orientation**,
+  2. **stabilize and compensate motion** (deskew LiDAR, warp tracks, Q19),
+  3. enable **visual-inertial odometry** for camera poses used in multi-view fusion (Q21),
+  4. classify **activity context** ("walking", "stationary") as text or metadata,
+  5. **gate inference** (reuse results when stationary, skip frames during violent motion).
+
+### 2.7 Which route for which task
+
+| Task | Route |
+|---|---|
+| Metric distance or size questions | Dense metric depth + symbolic values (or 3D-aware tokens) |
+| Navigation, "is the path clear" | BEV or occupancy + symbolic summary |
+| Object-level 3D QA and grounding | 3D object tokens or lifted features |
+| General scene description | RGB only (don't pay for other sensors) |
+| Low-light, textureless scenes | Depth or LiDAR assisted, with RGB fallback |
+
+## 3. Time synchronization
+
+**Why it matters:** sensors differ in rate (camera 30 Hz, LiDAR 10 to 20 Hz, ToF 30 to 60 Hz, IMU 200 to 1,000 Hz), latency and clock domain. Cameras may be rolling shutter (each row has a different timestamp). A spinning LiDAR collects points over a whole sweep, so a moving platform **distorts** the cloud.
+
+**Cost of small timing errors:**
+
+| Error | Effect |
+|---|---|
+| 10 ms at 1 m/s translation | 1 cm |
+| 10 ms at 100°/s rotation | 1° → about 8.7 cm lateral at 5 m, about 17 px at fx = 1,000 px |
+
+For camera-IMU visual-inertial systems, even a few milliseconds of **time offset** hurts accuracy, so it is usually estimated online.
+
+**Methods:**
+- **Hardware sync:** a common trigger or shared clock (PTP / IEEE 1588, PPS, camera strobe signals) so all sensors timestamp against the same clock. On Android, check the camera's timestamp source (`REALTIME` means the camera timestamps are comparable with sensor-event timestamps, verify on your device).
+- **Timestamp at capture, not at arrival.** A common bug is using message arrival time (e.g. ROS `header.stamp` set when received).
+- **Software alignment:** ring buffers per sensor, **interpolate** IMU to the camera timestamp, **SLERP + linear** pose interpolation, tolerance-based nearest-neighbor matching (e.g. ≤ 5 ms, otherwise drop), handling of jitter, drops and out-of-order data, and a linear clock-drift model.
+- **LiDAR deskewing:** use IMU or odometry to transform each point to a common timestamp (e.g. the camera exposure time).
+- **Rolling shutter:** model per-row timing and use per-row poses from the IMU for fast motion.
+- **Estimate offsets by calibration:** e.g. cross-correlate gyro angular velocity with optical-flow-derived rotation, or use Kalibr and VINS/OpenVINS-style online temporal calibration.
+- **Bundle assembly for the VLM:** a snapshot at time t: `{rgb(t), depth(t±δ), deskewed lidar(t), IMU window [t−Δ, t]}`. Use sliding windows for video.
+- **Test it:** a blinking LED or tap test (a visible event captured by the camera and a spike in the IMU), checkerboard-motion tests, and production monitoring of timestamp deltas with alerts.
+
+## 4. Calibration
+
+### 4.1 Intrinsics
+- **Camera:** focal lengths and principal point `(fx, fy, cx, cy)` plus distortion (radial-tangential, or fisheye / equidistant models). Calibrated with checkerboard or AprilGrid targets (Zhang's method, OpenCV, Kalibr).
+- **Per-frame variation:** on phones with OIS and autofocus, intrinsics and distortion can change per frame (focus breathing, lens shift). Android exposes per-frame calibration metadata (verify the keys on your device).
+- **LiDAR:** beam angles and per-beam offsets (factory calibration). **Depth sensors:** their own intrinsics, and the aligned-to-color depth mapping.
+- **IMU intrinsics:** scale and axis misalignment, bias, noise densities (Allan variance).
+
+### 4.2 Extrinsics (rigid transforms between sensors)
+- **Camera ↔ LiDAR:** target-based (checkerboard plane fitted in LiDAR points), or targetless (edge or mutual-information alignment, motion-based hand-eye calibration `AX = XB`, deep methods such as CalibNet / LCCNet).
+- **Camera ↔ IMU:** spatio-temporal calibration (Kalibr) that estimates the transform **and** the time offset, using excitation motion in front of a target.
+- **Camera ↔ depth:** register depth to the color frame using the extrinsics, with occlusion handling (z-buffering) when reprojecting.
+- **Conventions are a classic bug:** optical frame (z forward) vs robot base frame (x forward), handedness, **quaternion order (xyzw vs wxyz)**, units. Store everything as a transform tree and unit-test it.
+
+### 4.3 Sensitivity to calibration error (geometry)
+
+| Rotation error | Lateral error at 5 m | At 10 m | Pixel error at fx = 1,000 px |
+|---|---|---|---|
+| 0.1° | 0.9 cm | 1.7 cm | 1.7 px |
+| 0.5° | 4.4 cm | 8.7 cm | 8.7 px |
+| 1.0° | 8.7 cm | 17.5 cm | 17.5 px |
+
+A few pixels of error cause **semantic bleeding** when painting LiDAR points with image labels, and wrong depth at object edges.
+
+### 4.4 Drift and robustness
+- Thermal expansion, shocks, aging and device flex all change calibration. Monitor **reprojection and photometric consistency** (LiDAR edges vs image edges), detect drift, and re-calibrate online with targetless methods.
+- **Augment training with random extrinsic perturbations** (rotation noise of about 0.1 to 1°, translation noise of centimeters) so the model tolerates miscalibration.
+- **Multi-device products:** per-unit factory calibration must ship with the data and the app. Make models **camera-aware**, for example by conditioning on intrinsics or normalizing depth to a canonical focal length (Metric3D-style), so they generalize across devices.
+- **Scale from sparse metric points:** align a dense relative depth network to sparse ToF or LiDAR points with a robust per-frame scale and shift fit (section 2.2).
+
+## 5. Missing or degraded sensors, and sensor dropout in training
+
+**Failure modes:**
+- **Complete dropout:** sensor off, driver error, packet loss.
+- **Partial degradation:** ToF holes on glass, black or shiny surfaces, sunlight interference, LiDAR in rain, camera low light, overexposure, motion blur or a dirty lens, IMU bias drift or saturation under shock.
+- **Stale data:** timestamp lag.
+- **Calibration drift:** misaligned sensors.
+
+### 5.1 Training for robustness
+- **Modality dropout:** randomly drop **entire modalities** (replace with zeros or a learned "missing" token plus a mask), for example 10 to 30% per non-RGB modality, always keeping at least one. Train on mixtures of availability patterns (RGB-only, RGB+D, RGB+LiDAR, all) so the model works with **any subset**.
+- **Partial corruption augmentation:** random holes in depth, dropping 20 to 80% of LiDAR points, sensor-specific noise models (ToF multipath, quantization), time-offset jitter (±10 to 30 ms), extrinsic perturbation, exposure and blur augmentation for RGB, bias and noise for IMU.
+- **Modality competition:** multimodal models tend to over-rely on the easiest modality (modality collapse or "greedy learning"). Dropout helps, and you can add per-modality auxiliary heads or gradient-balancing methods.
+- **Efficient data strategy:** synchronized multi-sensor data is expensive.
+  - Use simulation (Gazebo, Isaac, Habitat, Q23) with realistic sensor noise.
+  - Use pretrained single-modality encoders (depth: Depth Anything, LiDAR: BEV or point pretraining).
+  - **Anchor alignment on RGB** (ImageBind-style): you only need (RGB, X) pairs to bind each modality into a shared space with text.
+
+### 5.2 Architecture and runtime
+- **Mask-aware encoders** that take explicit availability masks, **gated fusion** or attention with learned per-modality reliability (sensor confidence), separate unimodal pathways so removing one doesn't break the others, and a late-fusion fallback head. Some work (e.g. MetaBEV) targets arbitrary sensor failure.
+- **Health monitoring per sensor:** frame rate, timestamp monotonicity, valid-pixel ratio of depth, point count, IMU variance and saturation, image brightness and blur metrics (variance of the Laplacian), and cross-sensor consistency (depth vs monocular depth disagreement, LiDAR-image edge alignment).
+- **Graceful degradation:** fall back to RGB-only with monocular depth, lower confidence, add explicit uncertainty to the answer ("I can't measure distances reliably in this lighting"), and trigger re-calibration. For safety-critical functions (obstacle avoidance on a robot), use redundancy and fail-safe behaviour (e.g. stop on LiDAR failure).
+- **Robustness evaluation:** systematically corrupt each modality (dropout-rate sweeps, noise, time offset, calibration error, weather) and plot accuracy vs severity. Require graceful degradation (for example, a stated fraction of full performance with one sensor missing), and make sure multimodal training **doesn't regress RGB-only performance**.
+
+## 6. On-device architecture considerations
+- **Per-modality encoders mapped to compute units:** RGB hybrid or ViT on the NPU (Q18), depth CNN (INT8), LiDAR pillars → 2D CNN, IMU 1D CNN or GRU on the DSP or CPU. Run them in parallel on different units where possible.
+- **Token budget (Q2):** fuse before the LLM into a few tokens (a Perceiver-style resampler to 32 to 64 tokens), or add 3D position embeddings to the RGB tokens (no extra tokens).
+- **Memory (Q14):** extra encoders add weights and activations, roughly tens of MB each at INT8.
+- **Rate limits:** fusion runs at the slowest sensor's rate (e.g. LiDAR at 10 Hz). Reuse static-background features and temporal context.
+- **Energy (Q16):** active sensors (ToF, LiDAR) draw power. Duty-cycle them, use passive RGB + monocular depth when enough, and trigger active sensing for metric queries ("sensor scheduling").
+- **Privacy (Q17):** depth and LiDAR reveal home geometry and should be treated as sensitive, but they are **less identifying than RGB**, so they are a good basis for privacy-preserving presence, navigation and activity perception without storing images.
+
+## 7. Evaluation
+- **3D and spatial QA:** ScanQA, SQA3D, ScanRefer, Nr3D/Sr3D, OpenEQA, VSI-Bench (video spatial intelligence: distances, sizes, counting, route planning), BLINK and CV-Bench (relative depth), SpatialVLM-style spatial QA.
+- **Metric quality:** absolute relative error and δ < 1.25 accuracy for depth, distance error in centimeters for the product's range, ATE and RPE for pose.
+- **Robustness:** corruption sweeps and sensor-dropout matrices (section 5).
+- **Product tests:** for example "distance to obstacle within ±10 cm at 0.3 to 3 m", measured against a ground-truth rig.
+
+## 8. Strong interview answer
+> "Early fusion combines raw data before feature extraction, for example RGB-D channels or projecting LiDAR into the image or painting points with semantics. It is cheap, but needs precise calibration and sync, and it breaks pretrained RGB encoders. Mid fusion keeps separate encoders and fuses features, for example in BEV as in BEVFusion, and usually gives the best accuracy and supports modality gating. Late fusion merges per-sensor decisions, which is robust and modular but loses cross-modal cues. For a VLM, I'd map those to three routes. First, depth as a pseudo-image into the existing encoder, with a fixed metric range and the intrinsics provided, which is cheap but loses precision. Second, modality tokens: a small depth or pillar encoder with a projector, or lifting 2D features into 3D as in 3D-LLM, or adding 3D position embeddings to 2D patches as in LLaVA-3D, which adds no tokens. On-device I'd use pillar or range-image CNNs rather than point ops like FPS and kNN, which NPUs handle badly. Third, symbolic text, with metric values precomputed in code. For BEV, I'd note the ground-plane limitation indoors. A pragmatic on-device depth path is a dense relative-depth network aligned to sparse ToF or LiDAR with a robust scale and shift fit. IMU is mostly for gravity, motion compensation, VIO poses and gating. For synchronization, I'd use hardware timestamps on a common clock, timestamp at capture, interpolate IMU, deskew LiDAR, and estimate camera-IMU offsets, because 10 ms at 100°/s is about 9 cm at 5 m. For calibration, I'd manage intrinsics and extrinsics with a tested transform tree, watch conventions like quaternion order, calibrate camera-IMU with Kalibr, camera-LiDAR with target-based or targetless methods, monitor drift online, and train with extrinsic perturbation. For robustness, I'd train with modality dropout and partial corruption on mixtures of availability patterns, use mask-aware gated fusion, add health monitors and graceful fallbacks to RGB-only with explicit uncertainty, and evaluate with corruption sweeps while making sure RGB-only performance doesn't regress. I'd also budget tokens, duty-cycle active sensors for energy, and use non-RGB sensing for privacy where possible."
+
+## 9. Follow-up questions to prepare for
+1. Why does early fusion of a depth channel hurt a pretrained RGB encoder, and how would you mitigate it?
+2. How does LLaVA-3D add 3D awareness without adding tokens, and what does it need at inference?
+3. Why are PointNet++-style ops hard on NPUs, and what alternatives would you use?
+4. How would you recover metric scale from a monocular depth network and a sparse ToF sensor?
+5. How big is the error from a 10 ms time offset or a 0.5° extrinsic error, and how would you test for it?
+6. How does Kalibr estimate the camera-IMU transform and the time offset together?
+7. How does modality dropout prevent modality collapse, and what are its risks?
+8. How would you design runtime sensor health monitoring and a graceful-degradation policy for a home robot?

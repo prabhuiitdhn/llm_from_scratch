@@ -1253,3 +1253,375 @@ Train the few million projector parameters and freeze everything else.
 6. How would you tell a perception failure from a reasoning failure in a failing VQA sample?
 7. Why does a random split of UI screenshots overestimate accuracy, and how do you fix the split?
 8. When would you hot-swap LoRA adapters on-device, and what does the NPU runtime need?
+
+---
+
+# Q8: Data engineering for VLMs
+
+**Question:** How would you build a high-quality instruction dataset for a niche domain, such as a smart-home or robot perception assistant? Cover synthetic data from larger teachers, caption re-writing, hard-negative mining, dedup (perceptual hashes), contamination checks against benchmarks, privacy and PII (faces, license plates), and label noise. How do you validate the synthetic data?
+
+Thresholds and numbers below are typical starting points, not universal values. Calibrate them on your own data.
+
+## 0. Principles
+- **Data is the main lever** for a small VLM. The architecture is mostly solved, so quality, coverage and correctness decide the result.
+- **Build the evaluation set first.** A human-labeled golden set, never used for generation or training, defines "good".
+- **Every sample needs provenance.** Source, license, consent, how its label was produced (human, teacher model and version, or program) and its quality scores.
+- **Verify before you scale.** Synthetic data scales errors as easily as it scales volume.
+
+```
+Spec + golden eval → collect raw → quality/PII filter → dedup → decontaminate → balance/select
+   → generate (human seeds, programmatic, teacher) → verify (auto + consensus) → human audit
+   → hard negatives / preference pairs → version + ablate → iterate
+```
+
+## 1. Start from a spec, not from data
+Write down what the assistant must do, then derive the data from that.
+
+| Dimension | Examples for a smart-home / robot assistant |
+|---|---|
+| Task types | Object and state recognition ("is the stove on?"), reading displays (OCR), spatial questions ("what's left of the sofa?"), counting, hazard detection (wet floor, open flame, child or pet near a hazard), find-me-X, multi-turn follow-ups, **unanswerable** questions |
+| Output formats | Short answers, JSON state, boxes or points, refusals with a reason |
+| Conditions | Low light, IR night mode, motion blur, fisheye or wide-angle, low camera height (robot egocentric), clutter, occlusion, reflections |
+| Languages | English, Hindi and other target languages, in prompts and in on-screen text |
+| Sensors | RGB-only vs RGB + depth + LiDAR + IMU (see Q20) |
+
+Build a **coverage matrix** (scenes × objects × lighting × viewpoint × question type × language) and track fill rates per cell. Gaps in the matrix are where the model will fail in the field.
+
+## 2. Sourcing images
+
+| Source | Pros | Cons |
+|---|---|---|
+| Real captured (product cameras, consented) | Matches the deployment distribution | Privacy, collection cost, slow |
+| Public datasets (COCO, Open Images, ScanNet, ARKitScenes, HM3D, Replica, Ego4D-style) | Cheap, diverse | License terms, domain gap, benchmark overlap |
+| Simulation (Gazebo, Habitat, Isaac, MuJoCo) | **Free exact ground truth** (depth, segmentation, poses, object states) | Sim-to-real gap (Q23) |
+| Web scrape | Scale | License risk, noise, PII |
+| Generated images (diffusion) | Rare-case coverage | Domain gap, artifacts, often unrealistic details |
+
+Track the **license and provenance** of every source. A dataset with unclear rights can block a product launch.
+
+## 3. Producing labels
+
+### 3.1 Human annotation
+- Use for **gold seeds** (about 500 to 2,000 samples) and for the **golden eval set**.
+- Write clear guidelines with examples and edge cases. Measure inter-annotator agreement (Cohen's κ or Krippendorff's α) and revise the guidelines until it is acceptable.
+
+### 3.2 Programmatic labels from structured ground truth
+- From simulation or detectors, generate QA with **exact answers**: counts, distances (from depth), relations (from boxes and geometry), states (from the simulator).
+- Cheap and verifiable, but the language is templated. Paraphrase with an LLM, and keep the programmatic answer as the ground truth so paraphrasing can't change it.
+
+### 3.3 Synthetic data from larger teacher models
+- **Give the teacher more than the image:** pass detections, OCR output, depth or a scene graph as metadata. This anchors its answers.
+- **Use a rubric prompt:** question types, required output format, and an explicit instruction to say "not visible" when unsure.
+- **Two-step generation** (caption or description first, then Q&A) is often more grounded than direct Q&A.
+- **Patterns from public work:** LLaVA (text-only teacher given captions and boxes), ShareGPT4V and ALLaVA (detailed captions), Cambrian-style mixtures.
+- **License check:** some teacher models' terms restrict using their outputs to train other models. For a commercial product, verify the terms, or use a permissively licensed open teacher.
+- **Privacy rule:** do not send raw user or sensitive images to third-party APIs. Scrub or anonymize **before** any external call.
+- **Cost control:** cascade a cheap model first and escalate hard samples to a stronger teacher.
+
+### 3.4 Caption re-writing (recaptioning)
+- Raw alt-text is short, noisy and often unrelated to the image. Recaption with a VLM that writes detailed, factual descriptions of objects, states, positions, counts and visible text.
+- **Mix raw and synthetic captions** instead of fully replacing. Synthetic captions can be stylistically homogeneous, miss long-tail details and add hallucinations.
+- Use a domain-specific caption template that always mentions state, position, count and on-screen text.
+
+### 3.5 Hard-negative mining
+Hard negatives teach the model to discriminate near-misses:
+- **Text negatives:** swap an attribute, object or relation ("door open" → "door closed", "left" → "right"), or change a count.
+- **Image-side negatives:** pairs of images that look alike (high CLIP/DINO similarity) but differ in the labeled attribute (the "CLIP-blind pair" idea).
+- **Absent-object questions:** "Is there a cat?" when there isn't one, to reduce hallucination. Keep the yes/no ratio balanced.
+- **Model-driven mining:** samples where the current model is confidently wrong, or where it disagrees with the teacher or with itself across paraphrases.
+- **Preference pairs for DPO:** chosen = grounded answer, rejected = plausible but hallucinated answer (Q6, Q9).
+
+## 4. Deduplication
+
+| Level | Method | Notes |
+|---|---|---|
+| Exact | Hash of decoded pixels (e.g. SHA-256 after normalization) | Catches byte-level and re-encoded copies |
+| Near-duplicate (visual) | **Perceptual hashes** (pHash, dHash, aHash, wHash) with a Hamming-distance threshold (e.g. a small distance on a 64-bit hash) | Fast, but fragile to crops, rotations and color shifts |
+| Semantic duplicate | **Embedding similarity** (CLIP, SigLIP, DINOv2, or SSCD for copy detection) with a high cosine threshold, using ANN search (FAISS or HNSW); **SemDeDup**-style clustering to prune within tight clusters | Catches what hashes miss |
+| Video frames | Sample on scene change or embedding novelty, not at a fixed FPS | Consecutive frames are near-duplicates |
+| Text | MinHash-LSH on questions and answers; cap repeated templates | Avoids template collapse |
+
+Practical points:
+- **Group IDs.** Give each sample an app, device, scene or session ID. Cap the samples per group, and **split train/val/test by group**. Without this, near-identical screens end up on both sides of the split and inflate validation scores (Q7).
+- **Cluster-balanced sampling** reduces the head of the distribution and lifts the long tail.
+- **Image quality filters:** minimum resolution, blur (e.g. variance of the Laplacian), over- or under-exposure, corruption, extreme aspect ratios. For web data, an image-text alignment score (CLIPScore or SigLIP score) removes unrelated pairs. These scores are weak on fine detail, so don't rely on them alone.
+
+## 5. Contamination checks against benchmarks
+Contamination makes the benchmark numbers meaningless and can hide real regressions.
+
+- **Image level:** hash and embedding nearest-neighbor search between all training images and the test images of every benchmark you report. Many datasets share source images (COCO, Visual Genome, web crawls), so overlap is common.
+- **Text level:** n-gram overlap (e.g. 13-gram) and fuzzy matching on questions and answers.
+- **Pair level:** (image, question) combinations that match benchmark items.
+- **Teacher contamination:** a teacher that memorized a benchmark can reproduce its items when generating "new" data. Check synthetic data too.
+- **Process:** decontaminate first, then train. Report results with and without the overlapping items. Keep an internal golden set that is never used in prompts, seeds or generation, and version it. Use time-based splits where possible.
+
+## 6. Privacy and PII
+Sensitive items: faces, license plates, screens showing notifications, names, emails, phone numbers or addresses, documents, children, home interiors (bedrooms and bathrooms), GPS in EXIF metadata, and any audio.
+
+**Pipeline:**
+1. **Consent and legal basis first.** Data minimization, opt-in collection, retention limits, and awareness of the relevant regimes (e.g. GDPR, India's DPDP Act, Korea's PIPA). Involve legal and privacy teams early.
+2. **Strip metadata** (EXIF, GPS, device IDs).
+3. **Detect and handle faces and plates** (face and plate detectors): blur, pixelate, inpaint, or drop the sample.
+4. **OCR the image text** and run PII detection (regexes plus NER, e.g. Presidio-style). Mask the matching regions in the image and redact the corresponding text.
+5. **Scrub generated text** too. Teacher models can write real-looking names or leak details seen in the image.
+6. **Exclude sensitive scenes** entirely (e.g. bathrooms) unless there is a specific, consented need.
+7. **Access control, audit logs, deletion workflows.** If a user withdraws consent or a source's license is revoked, you must be able to remove their data and retrain, so keep lineage.
+8. **Memorization risk:** models can regurgitate training data. Deduplication, PII scrubbing and extraction tests reduce this.
+
+**Trade-off to call out:** blurred faces change the training distribution. If the product handles real faces on-device (e.g. person-related queries), models trained only on blurred faces may behave differently. Options: use consented data with real faces for those tasks, or use realistic anonymization (face replacement) rather than blur, and test on real faces.
+
+## 7. Label noise
+
+**Sources:** ambiguous questions, annotator errors, teacher hallucinations, template bugs, OCR errors, subjective attributes ("clean", "messy").
+
+**Detect:**
+- **Model-based:** confident learning / cleanlab-style detection using out-of-fold predictions, or high-loss samples after a first training pass.
+- **Consensus:** several teachers or sampled answers. Keep samples where, say, at least 2 of 3 agree.
+- **Consistency:** a paraphrased question should give the same answer, and the same question in a different format should too.
+- **Programmatic verification:** counts vs detector output, distances vs depth, text vs OCR engine output.
+- **Human spot audits** with stratified sampling (section 8).
+
+**Handle:** relabel, drop, down-weight, or add an "uncertain" class.
+
+**Caution:** don't over-filter. Removing every hard example biases the dataset toward easy cases. Keep **hard but correct** samples, and separate "hard" from "wrong".
+
+## 8. How to validate synthetic data
+
+Think of four layers of checks, from cheap to authoritative.
+
+### 8.1 Automatic verification
+- **Grounding checks:** extract the objects and attributes the generated text claims, and verify them with a detector or an independent verifier VLM using decomposed yes/no questions (TIFA/DSG/VQAScore- and CHAIR-style checks).
+- **Cross-teacher agreement and self-consistency:** sample several answers and keep the majority.
+- **Format validators:** JSON schema, answer type, length, language ID, boilerplate detection ("As an AI language model…").
+- **Geometry and state checks:** counts, spatial relations and distances against boxes, depth or simulator state.
+- **Blind test:** answer the question with a **text-only** model. If it is right without the image, the question leaks through language priors and has little visual value. Also try a **shuffled-image test**: if the answer doesn't change with a wrong image, the image isn't needed.
+
+### 8.2 Distribution checks
+- Diversity: n-gram and embedding-cluster coverage, question-type distribution, answer-length distribution, template-collapse rate.
+- Balance: yes/no ratio, class balance, per-cell fill in the coverage matrix.
+- Real-vs-synthetic gap: compare embedding distributions (FID-like for images, MAUVE-like for text). A synthetic set that is far from real data is a warning sign.
+
+### 8.3 Human audit
+- **Stratified sample per batch** (e.g. 300 to 1,000 items). With n = 400, the 95% confidence interval on an error rate is about ±5 percentage points.
+- Use an **error taxonomy** (hallucination, wrong count, vague, unsafe, wrong format), and set acceptance thresholds per slice (e.g. ≥95% correct).
+- If a batch fails, fix the **teacher prompt or pipeline** and regenerate, instead of patching individual samples.
+
+### 8.4 Downstream ablation (the authoritative test)
+- Train a small proxy model (or a short LoRA run) **with and without** the synthetic subset, and compare on the **real, human-labeled golden set**. The test data must never be synthetic.
+- Track hallucination metrics (POPE, CHAIR) too. Synthetic data can raise hallucination even while raising accuracy.
+- Run data-mixture ablations and scaling curves. Use influence or clustering analysis to find subsets that cause regressions.
+- **Model-collapse guard:** a student can't exceed its teacher, and repeated training on model outputs degrades diversity. Keep a fixed fraction of real data, use multiple teachers, and keep verifiers independent of the generator.
+
+## 9. Infrastructure
+- **Schema per sample:** image URI, content hash, group ID, source, license, consent flag, PII-scan result, label provenance (human / program / teacher + model version + prompt hash), quality scores, split.
+- **Versioning and lineage:** DVC, lakeFS or Delta-style versioning and manifests, so you can reproduce any training run and remove a source on request.
+- **Storage:** sharded formats (WebDataset, Parquet).
+- **CI for data:** automated checks on every dataset change: schema, leakage, duplicate rate, class balance, PII scan, and a small eval run.
+- **Data card** documenting sources, known biases, filters and intended use.
+
+## 10. Domain-specific notes for a smart-home / robot assistant
+- Use **simulation (Gazebo, Habitat, Isaac, MuJoCo)** to produce RGB, depth and segmentation with exact answers ("how far is the sofa?" with a metric answer), then mix with real images and evaluate on real images.
+- Capture **egocentric, low-height viewpoints** and camera artifacts (fisheye, rolling shutter, IR night mode).
+- Include **unanswerable and occluded** cases, and train calibrated answers like "I can't tell from this view", so the model doesn't guess.
+- Include **safety-relevant** cases (stove, wet floor, child or pet near hazards) with careful, reviewed labels.
+- Cover **multilingual prompts and on-screen text** (Hindi, Korean and others in your market).
+- Add **multi-turn and temporal** samples (video clips) when the product needs them.
+
+## 11. Illustrative pipeline numbers
+Expect heavy attrition: for example 300k raw images → about 100k after quality, PII, dedup and decontamination filters (a 30 to 50% yield is common) → generation and verification may drop a further 10 to 30% of samples. Plan collection volume accordingly.
+
+## 12. Strong interview answer
+> "I'd start with the product spec and a human-labeled golden eval set, and a coverage matrix over scenes, conditions, question types and languages. For sources I'd mix consented real captures, public datasets and simulation, where Gazebo or Habitat gives exact depth, segmentation and state for programmatic QA. For labels I'd use human gold seeds, programmatic QA from structured ground truth with LLM paraphrasing, and teacher-generated data where the teacher gets the image plus detections, OCR and depth, a rubric, and permission to say 'not visible', after checking the teacher's license terms and never sending unscrubbed private data to an external API. I'd recaption noisy captions but mix them with raw ones, and mine hard negatives from attribute swaps, absent-object questions, near-duplicate image pairs and model failures. I'd dedup with exact hashes, perceptual hashes and embedding or SemDeDup clustering, split by scene or app group to avoid leakage, and decontaminate against every reported benchmark at image, text and pair level. For privacy I'd strip EXIF, blur or replace faces and plates, OCR and redact PII, scrub generated text, and keep lineage so a deletion request is possible. For label noise I'd use multi-teacher consensus, consistency and programmatic checks, and cleanlab-style detection, while keeping hard-but-correct examples. Synthetic data is validated in four layers: automatic grounding and format checks including a text-only blind test, distribution checks, a stratified human audit with a confidence-interval-based acceptance threshold, and, finally, a downstream ablation on a real human-labeled test set, with hallucination metrics tracked."
+
+## 13. Follow-up questions to prepare for
+1. Why can perceptual hashes miss duplicates that embeddings catch, and what are the failure modes of each?
+2. How do you decide the similarity threshold for embedding-based dedup without deleting useful variation?
+3. What is the text-only blind test for VQA data, and what does a high blind-test accuracy tell you?
+4. How would you detect that a teacher model memorized a benchmark?
+5. What changes in the pipeline if the teacher's license forbids training on its outputs?
+6. Face blur vs face replacement: how does each affect a model that must handle real faces on-device?
+7. How would you estimate the error rate of a 200k synthetic set from a 400-sample audit, and what confidence do you get?
+8. What are the risks of training repeatedly on model-generated data (model collapse), and how do you mitigate them?
+
+---
+
+# Q9: Hallucination in VLMs
+
+**Question:** What causes object, attribute and relation hallucination (language-prior dominance, weak grounding, low-res features)? Compare mitigations: contrastive decoding (VCD), OPERA, RLHF-V / DPO with image-grounded preference data, grounding-aware training and higher-res encoders. How do you measure it (POPE, CHAIR, HallusionBench), and how would you set up a regression gate in CI?
+
+Method descriptions are from the papers as I remember them. Treat any numbers as approximate and check the original papers before quoting them.
+
+## 0. What "hallucination" means for a VLM
+The model produces content that is **not supported by the image** (faithfulness errors). Types:
+
+| Type | Example |
+|---|---|
+| **Object** | Mentions a "microwave" that isn't in the picture |
+| **Attribute** | Wrong color, state ("door open"), material, wrong count |
+| **Relation** | Wrong spatial relation ("left of") or action ("holding a cup") |
+| **Text / OCR** | Invents or misreads on-screen text |
+| **Presupposition** | Accepts a false premise ("why is the cat sleeping?" when there is no cat) |
+| **Temporal (video)** | Wrong event order |
+
+Note the difference between **faithfulness** (is it supported by the image?) and **factuality** (is it true in the world?). This question is about faithfulness.
+
+## 1. Causes
+
+### 1.1 Language-prior dominance
+- The LLM is much stronger than the visual pathway. It has strong **co-occurrence priors** ("kitchen → microwave, fork, knife").
+- CHAIR-style analyses find that hallucinated objects are usually those that frequently co-occur with objects that really are in the image.
+- **Text inertia grows during generation.** As the answer gets longer, the share of attention on image tokens tends to shrink and the model conditions more on its own previous words. An early hallucination then "snowballs" into later claims. OPERA ties hallucination to "summary token" attention patterns where the model over-trusts earlier text.
+- Yes/no questions show a **yes-bias** in many models.
+
+### 1.2 Weak grounding and alignment
+- **Information bottleneck:** a lossy projector or a heavy token reduction (Q1, Q2).
+- **Encoder limits:** contrastive features are global and bag-of-words-like (CLIP-blind pairs, Q4), so attributes and relations are poorly encoded.
+- **Training data teaches fabrication:** captions and instruction data that contain details the model cannot actually perceive. SFT on rich teacher-written descriptions can teach a weaker student to "fill in" plausible detail. Synthetic data with its own hallucinations adds more (Q8).
+- **Objective mismatch:** next-token likelihood doesn't penalize unsupported claims, and preference tuning can reward verbosity or agreement with the user.
+
+### 1.3 Low-resolution features
+- Small objects and text vanish after downscaling or aggressive pooling, and the LLM fills the gap with a plausible guess.
+- Tile boundaries can split objects (Q2).
+
+### 1.4 Decoding
+- Greedy or beam decoding favors the highest-probability, language-plausible continuation. Long outputs give more chances to drift.
+
+### 1.5 Small-VLM and on-device specifics
+- A small model has less capacity to both see and verify, and the token budget is tight.
+- **Quantization or token pruning can raise hallucination** (for example INT4 on the vision tower, or pruning visual tokens). Measure it on the deployed artifact.
+
+## 2. Mitigations compared
+
+### 2.1 Decoding-time (training-free)
+
+**VCD (Visual Contrastive Decoding):**
+- Run the model twice per step, once on the original image and once on a **distorted image** (Gaussian noise added). Combine logits as `(1 + α)·logit(original) − α·logit(distorted)`, with an adaptive plausibility constraint that keeps only tokens already likely under the original image.
+- Intuition: language-prior-driven tokens stay likely even when the image is corrupted, so subtracting the distorted distribution removes them.
+- **Cost:** about **2x decode compute and a second KV-cache**. Extra hyperparameters (α, noise level). It can hurt fluency or correct tokens.
+
+**OPERA:**
+- Beam search with an **over-trust penalty** on candidates showing a "knowledge aggregation" attention pattern, plus a retrospection step that rolls back to the summary token and re-selects.
+- **Cost:** beam search, needs access to attention maps (conflicts with fused attention kernels like FlashAttention), and is considerably slower.
+
+**Others:** PAI (amplify attention on image tokens at inference), DoLa-style layer contrast, M3ID, ICD, and post-hoc correctors such as Woodpecker and LURE (detector + LLM revision).
+
+**Simple controls:** lower temperature or greedy decoding, shorter answers, prompts that say "answer only from what is visible, say not visible if unsure", closed-vocabulary or schema-constrained outputs.
+
+### 2.2 Training with image-grounded preference data
+- **RLHF-V:** fine-grained, segment-level human corrections, with a dense DPO that weights the corrected segments more. Works with a small amount of high-quality data.
+- **RLAIF-V:** open-source AI feedback. Responses are split into atomic claims that are verified, and the loop can be run iteratively.
+- **POVID:** automatically builds rejected answers by injecting hallucinations, and uses noisy images.
+- **mDPO:** adds an **image-conditional** preference, where the same answer with a corrupted image is the "rejected" side, so the model is forced to use the image. It also adds an anchor so the chosen answer's likelihood doesn't drop.
+- Also: LRV-Instruction (negative instructions for robustness), HA-DPO, MPO.
+- **Cost at inference: zero.** This is why it fits on-device.
+- **Pitfalls:**
+  - Length bias: a model can lower its hallucination rate just by saying less. Always check recall or informativeness too.
+  - Likelihood displacement (add an SFT term).
+  - Off-policy data mismatch. On-policy samples (from the current model, labeled by a verifier) tend to work better.
+  - Preferences that don't actually depend on the image.
+
+### 2.3 Grounding-aware training
+- Train on **grounding tasks**: referring expressions, detection, region captioning (Kosmos-2, Shikra, Ferret, GLaMM-style data). This ties words to regions.
+- **Look-then-answer:** make the model output boxes or evidence first, then the answer. This forces evidence for object claims.
+- **Negative and abstention data:** absent-object questions, unanswerable and occluded cases, answers like "I can't see that" (Q8).
+- **Faithful SFT data:** don't train on details beyond what the model can perceive. Verify synthetic captions with grounding checks (Q8).
+
+### 2.4 Higher-resolution and better encoders
+- Higher resolution and tiling reduce small-object and OCR hallucination (Q2).
+- A mixture of encoders (e.g. DINOv2 + SigLIP) or a generatively trained encoder fixes CLIP-blind weaknesses (Q4).
+- **Cost:** more encoder FLOPs and more visual tokens on-device. Treat the resolution-vs-hallucination curve as part of your token-budget decision.
+
+### 2.5 System-level and post-hoc
+- **Verification pass:** check the generated claims with a detector, an OCR engine or a verifier VLM, and filter or rewrite unsupported claims.
+- **Uncertainty and abstention:** token-level entropy, self-consistency, calibrated confidence. Low confidence → abstain, ask for a better view, or route to the cloud (Q17).
+- **Product design:** closed vocabularies for detectable objects, showing evidence boxes in the UI, restricting what the assistant is allowed to claim.
+
+### Comparison
+
+| Method | Where | Training needed | Inference overhead | Strength | Weakness | On-device fit |
+|---|---|---|---|---|---|---|
+| VCD | Decoding | No | ~2x decode + 2nd KV-cache | Plug-and-play | Cost, fluency, hyperparameters | Poor |
+| OPERA | Decoding | No | Beam search, attention access | No retraining | Slow, kernel conflicts | Poor |
+| Preference tuning (RLHF-V, mDPO, RLAIF-V) | Training | Yes | **None** | Persistent, cheap at inference | Length bias, data quality | **Good** |
+| Grounding-aware training | Training | Yes | None (or short evidence tokens) | Evidence-based answers | Needs grounded data | Good |
+| Higher resolution / better encoder | Architecture | Yes | More compute and tokens | Fixes root cause for small things | Latency, memory | Depends on budget |
+| Post-hoc verifier / abstention | System | Optional | Extra pass or detector | Catches residual errors | Extra latency and components | Good if lightweight |
+
+## 3. What I'd do on-device (priority order)
+1. **Fix data first:** grounded, verified captions and instructions, negative and abstention samples (Q8).
+2. **Preference tuning** with on-policy, image-conditional pairs, plus an SFT term, checking informativeness alongside hallucination.
+3. **Right resolution** for the slices that matter (small objects, text), chosen from the resolution-vs-hallucination curve.
+4. **Lightweight verification and uncertainty-based abstention or routing.**
+5. **Avoid contrastive decoding** unless the latency budget allows 2x decode.
+
+## 4. How to measure
+
+### POPE (Polling-based Object Probing Evaluation)
+- Yes/no questions: "Is there a {object} in the image?", built from COCO-style annotations (also versions on other datasets).
+- Balanced positives and negatives. The negatives come from three sampling strategies: **random**, **popular** (frequent objects) and **adversarial** (objects that co-occur with present ones).
+- Metrics: accuracy, precision, recall, F1, and the **"yes" ratio** (to expose yes-bias).
+- Limits: only existence, limited vocabulary, and it saturates for strong models.
+
+### CHAIR (Caption Hallucination Assessment with Image Relevance)
+- On generated captions: `CHAIR_i` = hallucinated object instances ÷ all mentioned instances, `CHAIR_s` = captions with at least one hallucinated object ÷ all captions.
+- Uses COCO object annotations and synonym lists.
+- Limits: restricted to COCO categories, synonym handling, and it **rewards saying less**, so report coverage or recall alongside it.
+
+### HallusionBench
+- Image-question pairs that separate **language hallucination** from **visual illusion**, with edited or paired images and control questions. It reports consistency-style metrics (e.g. question-level and figure-level accuracy), which expose models that answer from priors.
+
+### Others
+- **MMHal-Bench** (LLM-judged, open-ended, several question types), **AMBER** (generative + discriminative, existence, attribute, relation), **MMVP** (CLIP-blind pairs), **GAVIE**, **HaloQuest**, and others.
+- **Build product-specific probes.** If you have ground truth (a simulator scene graph, annotated home images), you can auto-generate POPE-style probes: positives from the ground-truth objects, negatives from absent objects chosen at random, by popularity, and by co-occurrence. Do the same for attributes, relations, counts and OCR (string match).
+
+Metric weaknesses to remember: yes/no probes miss long-form hallucination, CHAIR misses attributes and relations, and LLM-judge scores have variance and bias.
+
+## 5. CI regression gate
+
+**Principles:**
+- **Fixed, versioned eval sets** and **deterministic decoding** (greedy, temperature 0, fixed prompt templates, fixed image preprocessing and seeds).
+- **Evaluate the deployment artifact**: the quantized model with the real preprocessing, token budget and runtime. Hallucination can change after quantization or token pruning, so an FP16 checkpoint result is not enough.
+- **Gate on several metrics together**, so no single metric can be gamed:
+  - POPE (adversarial split) F1, with the yes-ratio kept in a band (e.g. roughly 0.4 to 0.6).
+  - CHAIR_s and CHAIR_i must not rise by more than x points, **and coverage/recall must not fall by more than y** (this catches "say less" cheating).
+  - HallusionBench question- and figure-level accuracy.
+  - MMHal-style judge score (with a pinned judge version).
+  - **Product slices:** UI states, hazard detection, small objects, low light, multilingual OCR, counting, and the **abstention rate** on unanswerable cases (it must not collapse to zero or to always-refuse).
+- **Golden failures set:** every past incident or bug becomes a permanent test case.
+
+**Statistical rigor:**
+- Compute confidence intervals by bootstrap. Compare candidate and baseline on the **same items** with a paired test (e.g. McNemar for binary correctness) and gate on a significant regression, not raw noise.
+- For LLM-judge metrics, pin the judge model, and calibrate it against human labels periodically.
+- If you sample, use several seeds.
+
+**Tiering:**
+- **PR smoke test:** about 500 to 1,000 items, minutes.
+- **Nightly:** the full suite.
+- **Release gate:** full suite + on-device run + a human audit of about 200 long-form outputs.
+
+**Production monitoring after release:** thumbs-down rate, abstention rate, confidence-distribution drift, shadow evaluation and A/B tests, with the release criteria stating which trade-offs are acceptable (hallucination vs informativeness).
+
+**Sketch of a gate check:**
+```python
+def gate(cand, base):
+    # cand/base: dicts with per-item correctness arrays and aggregate metrics
+    assert 0.4 <= cand["pope_yes_ratio"] <= 0.6
+    assert cand["pope_adv_f1"] >= base["pope_adv_f1"] - 0.01
+    assert cand["chair_s"] <= base["chair_s"] + 0.01
+    assert cand["coverage"] >= base["coverage"] - 0.02   # blocks the "say less" trick
+    assert mcnemar_p(cand["correct"], base["correct"]) > 0.05 or \
+           cand["correct"].mean() >= base["correct"].mean()   # no significant regression
+```
+
+## 6. Strong interview answer
+> "VLM hallucination, meaning object, attribute and relation claims not supported by the image, has three main causes: the LLM's language priors dominate, especially as the answer gets longer and attention to image tokens fades; grounding is weak because of lossy connectors, global contrastive features and training data with details the model can't perceive; and low resolution loses small objects and text, which the LLM then fills in plausibly. Mitigations split by where they act. Decoding-time methods like VCD, which contrasts original and distorted-image logits, and OPERA, which penalizes over-trust patterns in beam search, need no training but cost roughly 2x decode or slow beam search with attention access, so they are poor fits for on-device. Training-time methods are better: preference tuning with image-grounded pairs like RLHF-V, RLAIF-V and mDPO, where mDPO adds image-conditional preferences, grounding-aware training with boxes and negative or abstention data, and higher resolution or a better encoder where small objects matter. Those add no inference cost, apart from resolution's compute. I'd also add lightweight verification and uncertainty-based abstention or cloud routing. For measurement I'd use POPE (with the yes-ratio), CHAIR with coverage, HallusionBench and product-specific probes auto-generated from ground truth. The CI gate runs deterministic decoding on the quantized deployment artifact, uses paired significance tests with confidence intervals, and gates on several metrics together so 'saying less' can't pass, with a permanent golden-failure set and a tiered pipeline."
+
+## 7. Follow-up questions to prepare for
+1. Why do hallucinated objects tend to be the ones that co-occur with the true objects?
+2. Why does VCD's distorted-image logit help, and when does subtracting it remove correct tokens?
+3. Why can DPO reduce hallucination just by making outputs shorter, and how do you detect that?
+4. What does mDPO's image-conditional term add over plain DPO?
+5. Why can quantization or token pruning raise the hallucination rate, and how would you localize which?
+6. How would you auto-generate POPE-style probes for attributes and relations from a simulator's scene graph?
+7. Why do CHAIR and POPE miss some hallucinations, and what would you add for long-form outputs?
+8. How would you design abstention so the model says "can't tell" without becoming useless?

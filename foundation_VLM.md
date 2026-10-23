@@ -2668,3 +2668,164 @@ each iteration:
 6. What must the prefix-cache key include, and what happens if you forget the LoRA adapter ID?
 7. How would you give a camera pipeline priority over a long VLM encoder graph on an NPU that can't preempt?
 8. How would you size the chunk for chunked prefill on a given NPU?
+
+---
+
+# Q16: Thermal, power and QoS
+
+**Question:** How do you design for sustained performance under thermal throttling and a battery budget (J/token, mJ/inference)? What are the strategies: adaptive resolution, early exit, model cascading (tiny classifier → small VLM → cloud), DVFS-aware scheduling, and heterogeneous CPU/GPU/NPU partitioning? How do you benchmark reproducibly?
+
+Power and energy figures are **assumption-based illustrations** (for example 4 pJ/bit for DRAM and 5 TOPS/W for an NPU). Real values vary by device, process node and what you count, so always measure. Android API details are from memory, so verify the API levels.
+
+## 0. Why this matters
+- A phone is passively cooled. The comfortable **skin temperature** limit (roughly the low 40s °C) sets the sustained power budget, which is only a few watts, far below the SoC's burst capability.
+- A cold device can burst for tens of seconds to a few minutes, then **throttle**: the thermal governor caps CPU, GPU, NPU and DRAM frequencies. A benchmark run on a cold phone therefore **overstates** real sustained performance.
+- Battery is finite: a 5,000 mAh battery at 3.85 V is about 19 Wh, or roughly **69 kJ**.
+- The NPU shares the SoC power and thermal budget with the CPU, GPU, ISP and modem, so a camera session and a VLM compete.
+
+## 1. Where the energy goes (illustrative model)
+
+Basic power model: `P = P_static (leakage, rises with temperature) + P_dynamic ≈ C·V²·f`. Lowering voltage and frequency cuts energy per operation, but runs longer, so static energy accumulates ("race to idle" vs "slow and steady").
+
+**Assumptions:** DRAM access about 4 pJ/bit, NPU about 5 TOPS/W effective at INT8, the ~2B VLM from Q14 (about 1.0 GB of weights read per decode token).
+
+| Stage | Energy estimate | Reasoning |
+|---|---|---|
+| Decode, per token | **~35 to 40 mJ** | Weight reads: 1 GB × 8 bits × 4 pJ ≈ 32 mJ. Compute: 2.6 GFLOP ÷ 5 TOPS/W ≈ 0.5 mJ. Plus KV, host and sampling |
+| Vision encoder (5 tiles) | ~0.25 J | About 1 TFLOP ÷ 5 TOPS/W ≈ 0.2 J, plus traffic |
+| Prefill (~380 tokens) | ~0.2 J | About 1 TFLOP |
+| 30-token answer | ~1.1 J | 30 × ~38 mJ |
+| **One query end to end** | **~1.6 J** | |
+
+**Consequences:**
+- **Decode energy is dominated by DRAM data movement, not arithmetic** (32 mJ vs 0.5 mJ). So the levers are **fewer bytes per token**: INT4 weights, KV quantization, GQA, a smaller vocabulary and LM head (Q1 deep dive), and **speculative decoding**, which reads the weights once per several accepted tokens and can roughly halve decode energy per token (Q15).
+- **Battery math:** 1% of the battery is about 690 J, so about **430 queries per 1%** at 1.6 J each. Always-on video at 1 frame per second, with about 0.4 J per frame, costs about 0.4 W, i.e. roughly **2% battery per hour**.
+- **Average power during decode:** 38 mJ × 25 tokens/s ≈ 1 W for NPU + DRAM, and roughly 2 to 3 W for the whole system. That is near a typical sustained envelope, so **continuous generation can throttle within minutes**, while bursty use does not.
+- For long answers, decode dominates energy, so **output length** is an energy lever as well as a latency lever.
+
+## 2. How throttling works
+- **Thermal zones** (CPU, GPU, NPU, skin, battery) feed a thermal governor (step-wise or power-allocator style) and a vendor thermal engine. Actions include capping CPU, GPU, NPU and DDR frequencies, reducing active cores, and, eventually, shutdown.
+- **Skin temperature** is prioritized for user comfort, so it often sets the sustained limit before the silicon junction temperature does. Heat spreads slowly, so the first 30 to 120 seconds are "free".
+- **Environment matters:** ambient temperature, a case, charging (heat from charging, especially wireless), sunlight, other apps, camera and ISP use, and the 5G modem.
+- **Throttling is not always smooth:** governor hysteresis can cause oscillation, which shows up as latency jitter and bad p99.
+- **Android signals:**
+  - `PowerManager.getCurrentThermalStatus()`: NONE, LIGHT, MODERATE, SEVERE, CRITICAL, EMERGENCY, SHUTDOWN, plus a listener for changes.
+  - `getThermalHeadroom(forecastSeconds)` (API 30+, forecasts up to about 60 s): a ratio where about 1.0 corresponds to severe throttling. Use it to **act before the cliff**.
+  - Per-zone temperatures in `/sys/class/thermal/*/temp` (for measurement).
+
+## 3. Strategies
+
+### 3.1 Reduce work per query
+Energy scales with work, so the cheapest watt is the one you don't spend: INT4/INT8 (fewer bytes), fewer visual tokens (Q2), shorter outputs, encoder and prefix caches (Q15), speculative decoding where it pays off, and no re-encoding of unchanged frames.
+
+### 3.2 Adaptive quality ("anytime" operation)
+Build a **ladder of operating points** and move along it based on thermal and battery state:
+
+| Level | Tiles / resolution | Visual-token budget | Max output tokens | Speculation k | Model tier | Frame rate (video) |
+|---|---|---|---|---|---|---|
+| L0 (cool, plugged) | Full | Full | Full | On | 1.5B | Full |
+| L1 | Fewer tiles | Reduced | Capped | On | 1.5B | Reduced |
+| L2 | 1 tile | Low | Short | Off | 1.5B | Low |
+| L3 | 1 tile | Minimal | Very short | Off | 0.5B | Event-triggered |
+| L4 | Offload or decline | — | — | — | Cloud / "try later" | — |
+
+Implementation notes:
+- **Pre-compiled static graphs per level**, kept resident (memory cost, Q14), so switching is fast on a static-graph NPU (Q13).
+- Matryoshka-style nested token budgets (Q2) let one model run at several token counts.
+- **Use accuracy-per-level data** (the Pareto curve from Q2) and set **quality floors** for safety-critical tasks, so hazard detection is never degraded below a set level.
+- **Controller design:** a state machine with **hysteresis** (separate up and down thresholds, minimum dwell time) to avoid oscillation, driven by thermal status, headroom forecast, battery level and power-saver state. Prefer **gradual degradation before the hardware cliff**.
+
+```python
+def choose_level(status, headroom, battery, current):
+    want = current
+    if status >= SEVERE or headroom > 0.95:   want = min(current + 1, MAX_LEVEL)
+    elif status <= LIGHT and headroom < 0.6 and battery > 0.2:
+                                               want = max(current - 1, 0)   # recover slowly
+    if battery < 0.15 or power_saver:          want = max(want, 2)
+    return want if dwell_time(current) > MIN_DWELL or want > current else current
+```
+
+### 3.3 Early exit and dynamic compute
+- Confidence-based **early exit** in the vision encoder or LLM layers (layer-skip style), adaptive token pruning or merging, and skipping the LLM for easy classification-like questions. For vision, adapt tiles to text density.
+- **Static-graph caveats:** early exit needs graph segments with host-side checks or exit-specific graphs. For LLM decode, skipped layers still need their KV filled in (state copying), which reduces the benefit.
+- **Risks:** exit confidence must be calibrated, and exit heads need training. Quality can drop silently, so evaluate per slice (Q9, Q24).
+
+### 3.4 Model cascades (tiny → small VLM → cloud)
+- **Stage 0:** an always-on tiny detector or classifier on a low-power unit (DSP, sensor hub, small NPU island) at milliwatt scale, tuned for **high recall**, which wakes the next stage. Add event triggers such as frame differencing and scene-change gating.
+- **Stage 1:** the small on-device VLM (≤2B).
+- **Stage 2:** a larger model or the cloud, only for low-confidence or hard cases (Q17).
+- **Cost model:** `E = c0 + p1·c1 + p1·p2·c2`, where `p_i` is the fraction of queries reaching stage i. Choose thresholds to minimize energy subject to an accuracy floor, and plot the accuracy-vs-energy curve.
+- **Calibration** of confidences is essential. The costs of a missed event (false negative at stage 0) and of a bad deferral should be explicit.
+- **Cloud is not free in energy:** transmitting an image over a cellular radio costs energy, and the radio stays in a high-power state for seconds afterwards ("tail energy"). With a weak signal, offloading can cost as much as, or more than, local inference. Measure the break-even, and respect privacy constraints (Q17).
+
+### 3.5 DVFS-aware scheduling
+- **Phase-aware operating points:**
+  - The encoder and prefill are **compute-bound**, so they benefit from a high NPU clock (a burst profile).
+  - Decode is **memory-bound**, so a higher NPU clock adds power without speed. Prefer a lower or balanced NPU clock with enough DRAM bandwidth, which saves energy at nearly the same speed.
+  - Mechanisms: vendor performance profiles (QNN/HTP burst, balanced, power-saver style settings, and Exynos NPU performance modes, verify), NNAPI-style preferences (sustained speed vs low power, now deprecated), and Android's performance-hint APIs for CPU threads.
+- **Avoid governor lag:** clocks take tens of milliseconds to ramp, so the first inference is slower. Send a **pre-boost hint** when the user opens the camera, before the request arrives.
+- **Race-to-idle for background work:** batch background jobs into bursts so the SoC can enter deep idle, and use constraints like "charging, idle and battery not low" (e.g. WorkManager).
+- **Don't busy-wait:** while the NPU runs, block on a fence or interrupt instead of spinning a CPU core. Pin orchestration threads to a mid or little core to avoid waking the prime core.
+- **Smooth over hard cliffs:** use the headroom forecast to reduce load gradually.
+
+### 3.6 Heterogeneous partitioning
+- Use the **most energy-efficient unit for each stage**: NPU for INT8 matmul-heavy work (often several times more energy-efficient than CPU or GPU for the same workload, verify on your target), GPU for flexible FP16 ops and fallback, CPU for control, sampling and small ops, and a low-power island for the stage-0 cascade.
+- **Avoid ping-pong:** each unit switch costs latency, copies, cache maintenance and synchronization, so keep partition boundaries few and use zero-copy buffers.
+- **Thermal spreading:** splitting work across units spreads heat across different thermal zones and can raise sustained throughput, but it increases total power, so it can hurt skin temperature and battery. Measure rather than assume.
+- A CPU decode path is a fallback, and costs much more energy per token.
+
+### 3.7 Battery and system policies
+- Respect **battery saver**, low battery, and battery temperature. Charging adds heat, so plugged-in is not automatically a free pass for heavy compute.
+- Unload models when idle, avoid wake locks and unnecessary wakeups, and schedule heavy background indexing for when the phone is charging, idle and cool.
+- Reduce the always-on frame rate when no one is looking.
+
+## 4. QoS: define the contract
+- **Service classes:** interactive (TTFT and TPOT targets) vs background (best effort).
+- **Under throttling, degrade quality in a controlled order, not latency randomly,** for example fewer tiles, then shorter outputs, then a smaller model, then offload.
+- Each feature gets: an accuracy floor, a latency target, an energy budget, and a fallback.
+- Android has no OS-level NPU QoS arbitration that you can fully rely on (verify), so cooperation inside the app and with the vendor SDK's priority settings matters.
+- Report **p95 steady-state latency** after throttling, not just cold performance.
+
+## 5. How to benchmark reproducibly
+
+### 5.1 Sources of variance
+Ambient temperature, **starting temperature** (cold vs heat-soaked), battery state of charge (voltage and peak power limits, battery aging and internal resistance), charging state, USB cable (it charges the phone and changes thermals), screen brightness and refresh rate, background apps and sync, radios, OS and firmware version, governor settings, DRAM state and page cache, device-to-device silicon variation, case and orientation, airflow.
+
+### 5.2 Protocol
+1. **Controlled setup:** a thermally controlled room (e.g. 25 ± 1 °C), a standard fixture (same stand, no case, fixed orientation, still air or a fixed fan), screen off or fixed, airplane mode or a fixed network, background apps killed, a fixed OS build and power-mode settings.
+2. **Power measurement:** an external monitor with battery bypass (Monsoon, Otii, Joulescope-style) for accuracy. The on-device fuel gauge or `BatteryManager` is coarse (about 1 s, low accuracy). Pixel-class devices expose on-device rail monitors (verify per device). Subtract the **idle baseline** measured under identical conditions.
+3. **Pre-conditioning:** cool to a known start temperature before each run (e.g. skin temperature below a set value), and also run a **heat-soaked** variant (a fixed load for about 10 minutes first). Report both.
+4. **Workload:** fixed prompts, images and decoding settings, a **fixed output length for benchmarking** (ignore EOS to remove variance), plus a separate realistic mix. Run for a fixed duration (15 to 30 minutes), with both a continuous duty cycle and a bursty one (e.g. one query every 10 s).
+5. **Logging at 1 Hz or better:** per-inference TTFT and TPOT, tokens/s, power, energy per inference, all thermal zones plus a skin-temperature measurement (IR sensor or thermal camera), CPU/GPU/NPU/DDR frequencies, throttle state and battery.
+6. **Statistics:** at least 5 runs per configuration, **interleaved A/B/A/B** order to cancel drift, rest between runs to return to baseline, at least 3 device units to measure unit variance, and report medians with spread (p5 to p95) or confidence intervals.
+7. **Report the right metrics:**
+   - Peak (first minute) vs **sustained** (e.g. the last 5 minutes) performance, and **time to throttle onset**.
+   - **Energy per inference and per token**, and battery % per hour for the use case.
+   - Maximum skin temperature.
+   - **Quality under each throttling state**, since adaptive policies change accuracy. Always report the accuracy–latency–energy triple.
+8. **Reference:** MLPerf Mobile defines controlled conditions and cooldown intervals, a useful model for protocol design (verify the exact rules).
+
+### 5.3 Test the controller deterministically
+- You can't wait for a phone to heat up on every CI run. On Android, `adb shell cmd thermalservice override-status <level>` (and `reset`) lets you emulate thermal states to test that your policy reacts correctly (verify the command on your OS version).
+- Add **nightly power and thermal regression tests** on real devices, with relative gates (e.g. fail if J/token regresses by more than a set percentage).
+
+### 5.4 Pitfalls
+- Measuring on a cold device, or over USB power.
+- Ignoring the idle baseline.
+- Lab results that differ from the field (pocket, sunlight, a hot car, a case).
+- A controller that oscillates, or lowers quality without measuring it.
+- Differences between device variants and regions (Snapdragon vs Exynos thermal behavior differ).
+- OS updates that change governors, and battery aging.
+
+## 6. Strong interview answer
+> "I'd start from an energy model. Decode energy is dominated by DRAM traffic, not arithmetic: with about 1 GB of weights per token at roughly 4 pJ/bit that's about 32 mJ against about 0.5 mJ of compute, so INT4, KV quantization, GQA, a smaller LM head and speculative decoding directly cut J/token. At about 1.6 J per query, 1% of a phone battery is about 400 queries, and continuous generation near 2 to 3 W will hit a skin-temperature-limited sustained envelope within minutes. So I'd design for sustained, not peak, performance. I'd build a ladder of operating points, with tiles or resolution, visual-token budget, output length, speculation and model tier, pre-compiled as static graphs, driven by a controller that uses thermal status and the headroom forecast, with hysteresis and quality floors for safety-critical tasks, so it degrades gradually before the cliff. I'd use a cascade, with an always-on tiny detector tuned for recall waking the small VLM, and low-confidence cases going to the cloud, after measuring the radio and tail energy, because offload can cost as much as local inference. For DVFS, compute-bound encoder and prefill phases get a burst profile and memory-bound decode gets a balanced one, with pre-boost hints and no busy-waiting. For partitioning, I'd put matmul on the NPU, keep the boundaries few and zero-copy, and measure thermal spreading rather than assume it. To benchmark, I'd control ambient temperature, fixture, screen, radios and battery state, pre-condition to known start temperatures including a heat-soaked case, use an external power monitor with an idle baseline, run 15 to 30 minutes with fixed output lengths, interleave A/B runs across several units, and report peak vs sustained throughput, throttle-onset time, J/token, skin temperature and accuracy at each operating point. I'd emulate thermal states for CI, and add nightly relative power and thermal gates."
+
+## 7. Follow-up questions to prepare for
+1. Why is decode energy dominated by memory traffic rather than compute, and how does that change which optimizations pay off?
+2. Why can lowering the NPU clock during decode save energy at almost no latency cost?
+3. How does the thermal headroom forecast help avoid a hard throttling cliff, and how do you prevent oscillation in the controller?
+4. When is offloading to the cloud more expensive in energy than running locally?
+5. How would you choose the thresholds in a three-stage cascade to meet an accuracy floor at minimum energy?
+6. Why does a cold-start benchmark misrepresent real-world performance, and how do you design a fair comparison?
+7. What are the trade-offs of spreading work across the NPU, GPU and CPU for thermals?
+8. How would you test the thermal controller in CI without heating a physical device?

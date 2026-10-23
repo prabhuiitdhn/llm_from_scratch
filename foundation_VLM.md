@@ -3596,3 +3596,260 @@ A few pixels of error cause **semantic bleeding** when painting LiDAR points wit
 6. How does Kalibr estimate the camera-IMU transform and the time offset together?
 7. How does modality dropout prevent modality collapse, and what are its risks?
 8. How would you design runtime sensor health monitoring and a graceful-degradation policy for a home robot?
+
+---
+
+# Q24: Evaluation beyond public benchmarks
+
+**Question:** MMMU, MMBench, TextVQA, DocVQA, ChartQA, OCRBench and POPE don't reflect device reality. How would you build an evaluation suite for a product feature (e.g. on-device visual search or scene understanding on a phone, TV or robot)? Cover task-specific metrics, LLM-as-judge for VLMs and its biases, slice-based analysis (low light, motion blur, rotated or occluded images, multilingual OCR, e.g. Hindi/Indic scripts), A/B testing, regression detection, and quantifying the accuracy loss from each optimization step (quantization, pruning, token reduction).
+
+Sample sizes and thresholds below are worked examples from standard statistics. Benchmark descriptions are from memory. Illustrative result tables use assumed numbers, not measurements.
+
+## 0. Why public benchmarks don't ship products
+
+| Benchmark | What it measures | Why it is not a ship criterion for a device feature |
+|---|---|---|
+| **MMMU** | College-level, multi-discipline exam reasoning | Far from camera tasks. Tells you little about perception in the wild |
+| **MMBench** | Broad capability, multiple choice, circular evaluation | Multiple choice, curated images, English |
+| **TextVQA** | Reading text in natural images (VQA accuracy) | Real-world text, but mostly English and clean images |
+| **DocVQA** | Document images (ANLS) | Scanned documents, not phone captures |
+| **ChartQA** | Charts (relaxed accuracy) | Specific domain |
+| **OCRBench** | OCR across several task types (score out of 1,000) | Mostly Latin and Chinese. Limited Indic coverage (verify) |
+| **POPE** | Object hallucination (yes/no) | COCO objects only, saturating, existence only (Q9) |
+
+**Systematic mismatches:**
+- **Distribution:** curated, clean, English, high-resolution web images vs real camera frames with blur, low light, rotation, occlusion and device-specific optics.
+- **Task:** exam-style multiple choice vs short grounded answers, structured outputs, grounding, abstention and multi-turn use.
+- **Metric:** one average accuracy vs per-slice tails and severity-weighted errors, with no latency, energy or memory.
+- **Numerics:** FP16 research checkpoints vs the INT4/INT8 artifact running on the NPU.
+- **Saturation and contamination** (Q8).
+
+**Use them as:** capability sanity checks and regression tripwires, not as the release decision.
+
+## 1. The evaluation system: layers
+
+| Layer | Purpose | Cadence |
+|---|---|---|
+| **L0: component and parity tests** | Preprocessing parity, tokenization, coordinate transforms (Q19), export parity (Q13) | Every commit |
+| **L1: public capability benchmarks** | Sanity and regression tripwire (contamination-aware) | Nightly |
+| **L2: product task golden sets** | The core. Real tasks, real captures | Nightly, gates |
+| **L3: robustness and slice suite** | Conditions, languages, scripts, devices | Weekly, release gate |
+| **L4: safety, hallucination, abstention** | Q9, Q17, prompt injection (Q25), privacy | Hard gate |
+| **L5: system metrics** | Latency, energy, memory, thermal, tied to quality (Q12 to Q16) | Nightly on a device farm |
+| **L6: human evaluation** | Pairwise preference, native-language raters | Per release |
+| **L7: online** | Staged rollout, A/B, telemetry | Continuous |
+
+## 2. Building the product evaluation set
+
+### 2.1 Start from the spec (Q8)
+Take the task taxonomy and user journeys, and define what "correct" means for each.
+
+**Examples:**
+- **On-device visual search** (gallery search, "my dog at the beach"): Recall@K, MRR, nDCG@K, mAP; false-positive rate (wrong or sensitive photos shown); multilingual and code-mixed queries; negation ("dog but no people"), attributes (color), counts; hard negatives (similar scenes); latency, index size and memory; behaviour proxies like reformulation rate.
+- **Scene understanding on a phone camera:** answer correctness, grounding (box IoU, pointing accuracy), counting error, OCR error, structured-output validity, abstention quality, claim-level hallucination.
+- **TV:** on-screen text and content recognition at viewing distance, glare, compressed 4K frames.
+- **Robot:** object search, spatial questions with metric error (Q20), hazard detection at fixed false-positive rate, multi-turn tasks, real-time constraints, sim-to-real gap (Q23).
+
+### 2.2 Data sources
+- **Real captures from target devices** (consented), spanning users, regions, devices and lighting. Stratified samples from opt-in logs, anonymized (Q8, Q17).
+- **Synthetic or simulated data** for rare or dangerous cases. Label it clearly, and never use it as the only evidence.
+- **Adversarial and red-team sets.**
+- **Hidden release-gate set:** keep it unseen by developers, and rotate it, to avoid overfitting to the evaluation. Refresh periodically (for drift), with an anchor subset for trend continuity.
+- Everything **frozen and versioned**, with decontamination from training data (Q8).
+
+### 2.3 Annotation
+- Written guidelines, at least 3 annotators for subjective items, adjudication, and inter-annotator agreement targets (κ or α).
+- Allow **multiple valid answers** or rubrics, and include "unanswerable" labels.
+- Tag **slice metadata** automatically at capture or by estimators: blur (variance of the Laplacian or gyro during exposure), brightness histogram, EXIF or gyro orientation, occlusion percentage, object size, script and language ID, device and camera. This makes slicing free later.
+
+### 2.4 How big? (worked statistics)
+- **Overall paired comparison:** to detect a 2-point accuracy difference with a paired design, when the two models disagree on about 8% of items, you need roughly `n ≈ (1.96 + 0.84)² × 0.08 / 0.02² ≈ 1,570` items (95% confidence, 80% power).
+- **Per-slice confidence:** for a proportion near 0.8 with n = 400, the 95% half-width is `1.96 × √(0.8×0.2/400) ≈ 3.9` points. Each slice needs its own sample size, so a slice of 100 items tells you very little.
+- **Rule of thumb:** at least 300 to 500 items per slice that gates a release, and several thousand overall.
+
+## 3. Task-specific metrics
+
+| Task | Metrics |
+|---|---|
+| Short-answer VQA | Normalized exact match, soft VQA accuracy, **ANLS** (normalized Levenshtein similarity with a threshold, used for DocVQA) |
+| OCR | CER, WER, normalized edit distance, field-level exact match, key-value F1. For Indic scripts, **grapheme-cluster-level CER** (section 5.3) |
+| Grounding and detection | IoU, Acc@0.5, AP, pointing accuracy |
+| Counting | MAE, exact match |
+| Retrieval and search | Recall@K, MRR, nDCG, mAP |
+| Captions and descriptions | **Claim-level factuality** (precision of claims and recall of key facts), CHAIR (Q9). Don't rely on CIDEr alone |
+| Structured output | Schema validity rate, JSON parse success, field accuracy |
+| Spatial and metric | Absolute error in cm or %, threshold accuracy (Q20) |
+| Abstention and calibration | Selective accuracy at a given coverage, risk–coverage area, abstention precision and recall, ECE (Q17) |
+| Safety-critical | Recall at a fixed false-positive rate, **false alarms per day**, **severity-weighted error** (a cost matrix: missing "stove on" costs more than misnaming a plant) |
+| Multi-turn | Task success rate, consistency across turns, memory (Q22) |
+| Efficiency | TTFT, TPOT, energy per query, peak memory, sustained throughput under thermal throttling (Q12 to Q16). Report **quality at the latency SLO** and Pareto plots |
+| User-centric | Pairwise preference, edit or correction rate, task completion, abandonment, thumbs, reformulation rate |
+
+## 4. LLM-as-judge for VLMs, and its biases
+
+**When to use it:** open-ended answers where exact match fails. Prefer programmatic metrics wherever possible, and use a judge as a last resort.
+
+**Setups:** pointwise rubric scoring, pairwise comparison (A vs B), reference-based comparison, and **claim decomposition** (extract atomic claims and verify each against the image or reference, as in TIFA, DSG and VQAScore-style approaches), which is usually more reliable than one holistic score.
+
+**Known biases and failure modes:**
+
+| Bias | Description |
+|---|---|
+| Position bias | Prefers the first or second answer |
+| Verbosity / length bias | Longer looks better |
+| Self-preference | Prefers outputs from its own model family or style |
+| Style and formatting bias | Confident tone, markdown, structure |
+| Sycophancy to the reference | Over-trusts the provided answer |
+| **Judge hallucination (VLM-specific)** | A VLM judge can miscount, misread small text, or accept a hallucinated claim |
+| **Blind judge** | A text-only judge can't verify image-grounded facts and rewards plausible answers |
+| Language and cultural bias | Weaker in Hindi and other Indic languages, so scores are noisy or favour English-fluent answers |
+| Score compression | Everything gets 4 or 5 out of 5 |
+| Non-determinism and prompt sensitivity | Different runs, different scores |
+| Silent version drift | API judges change without notice |
+| Goodhart's law | Training to please the judge |
+
+**Mitigations:**
+- **Swap positions** and require agreement (otherwise tie). Use **length-controlled** comparisons.
+- Use an **ensemble of diverse judges** from different families.
+- Use **binary checklist rubrics** that require quoting visual evidence.
+- Give the judge **ground-truth metadata** (object lists, OCR text, boxes) instead of relying on its own vision, or verify claims with a detector or OCR engine (a tool-augmented judge).
+- Temperature 0, **pin the judge model version and prompt**, and version-control them.
+- **Calibrate against humans:** label a stratified sample (200 to 500 items), measure Cohen's κ, rank correlation or pairwise accuracy, **per slice** (language, script, image type), and only trust slices with adequate agreement. Re-calibrate whenever the judge changes.
+- Audit 5 to 10% of judged items with humans periodically.
+- Use judges for **relative comparisons** (A vs B) more than for absolute scores, with bootstrap confidence intervals.
+- **Unit-test the judge:** padded long answers, swapped answers, and confident nonsense should all be scored correctly.
+- For Hindi and other Indic languages, rely more on programmatic metrics (OCR CER) and native-speaker human evaluation.
+
+## 5. Slice-based analysis
+
+### 5.1 Slice dimensions
+
+| Group | Slices |
+|---|---|
+| **Capture conditions** | Low light, backlit or overexposed, motion blur, defocus, rotation (EXIF 0/90/180/270, arbitrary tilt, upside-down text), partial occlusion (including a finger over the lens), small objects (area %), clutter, glare and reflections, JPEG or video compression, low resolution or digital zoom, camera type (ultra-wide fisheye distortion, front camera, telephoto), photos of screens (moiré), distance |
+| **Content** | Text-heavy vs scene, document types (receipts, forms, signboards, packaging, handwriting), **script and language**, fonts, vertical and curved text, rare object categories, regional items (food, dress, appliances), **people-related fairness** (error-rate parity across skin tones, age, attire, region, without inferring sensitive attributes) |
+| **User and context** | Locale, device tier (RAM class), connectivity (on-device vs cloud route, Q17), **thermal and battery state and the adaptive operating level** (Q16), offline vs online, quantization tier |
+| **Query** | Counting, spatial, OCR, attribute, negation, multi-hop, ambiguous, unanswerable, query language (Hindi, Hinglish, code-mixed) |
+
+### 5.2 Method
+- Tag items automatically and manually. Report **per-slice metrics with confidence intervals**, the **worst-slice score**, and disparity ratios.
+- **Release criteria** like: "no slice with n ≥ 300 falls more than Y points below overall", or "low-light accuracy is at least 90% of normal-light accuracy".
+- **Discover unknown slices:** cluster the embeddings of failures, use slice-discovery tools, or LLM-based failure summaries, and add production failures as new slices.
+- **Synthetic corruptions** (ImageNet-C style: noise, motion blur, defocus, brightness, JPEG, rotation, cutout, glare, at severities 1 to 5) extend the golden set cheaply and give **degradation curves**. They are proxies, though: real night-mode and ISP processing differ from synthetic noise, so validate with real captures.
+
+### 5.3 Indic and multilingual OCR specifics
+- **Scripts:** Devanagari, Tamil, Telugu, Bengali, Gujarati, Kannada, Malayalam, Gurmukhi, Urdu (right-to-left), and mixed-script text (Hinglish, Latin transliteration). **Report each script separately**, not as one "multilingual" average, and weight by your user population.
+- **Metric details:** use **grapheme-cluster-level CER** after Unicode normalization (NFC/NFKC), with correct handling of conjuncts (e.g. क्ष, त्र), vowel signs (matras), and ZWJ/ZWNJ. Code-point CER distorts errors. Normalize numerals (Devanagari vs Arabic digits).
+- **Data:** signboards, receipts, packaging, medicine labels, appliance panels and UI screens (relevant for Samsung devices), mixed-script screenshots, low-resolution and handwriting samples. Public multilingual benchmarks have limited Indic coverage (verify), so plan to build your own, with native-speaker annotators.
+- **Separate three things:** the language of the **prompt**, the language of the **scene text**, and the language of the **answer**.
+- **Tokenization efficiency:** Indic text can inflate token counts several times (Q1 deep dive), which affects decode latency and energy. Report tokens per word and latency per script alongside accuracy.
+
+## 6. Regression detection (CI)
+
+**Pipeline tiers:**
+- **PR smoke test:** 500 to 1,000 items, minutes.
+- **Nightly:** full golden set and slices.
+- **Release gate:** everything, plus on-device runs and a human audit.
+
+**Statistics:**
+- **Paired comparisons** on identical items. McNemar's test for binary correctness, paired bootstrap for continuous metrics (ANLS, CER, judge scores).
+- **Non-inferiority testing** with a pre-set margin (TOST-style), instead of the weak claim "no significant difference". Report the minimum detectable effect.
+- **Multiple comparisons:** pre-register primary metrics, or control false discoveries (Benjamini–Hochberg) across many slices.
+
+**Gate design:**
+- **Hard gates (zero tolerance):** safety, privacy, format validity, crashes.
+- **Soft gates:** accuracy within the non-inferiority margin per slice.
+- **Efficiency gates:** p95 latency, energy per query, memory.
+
+**Reproducibility:** deterministic decoding (greedy or temperature 0), fixed preprocessing and seeds, a pinned judge, the build hash recorded, flake detection (re-run failures, and track items with unstable outcomes).
+
+**Golden failures:** every field bug becomes a permanent test.
+
+**Cross-target regression:** run the same suite on each backend (Snapdragon NPU, Exynos NPU, CPU fallback, Q13) and track the delta against a reference.
+
+**Production drift monitoring:** input drift (embedding drift, brightness histograms), output drift (answer length, abstention rate, confidence histograms), feedback signals, with alert thresholds, plus consented shadow sampling.
+
+**Small snippet: flip analysis and McNemar**
+```python
+def compare(base_correct, cand_correct):          # arrays of 0/1 over the same items
+    b = ((base_correct == 1) & (cand_correct == 0)).sum()   # regressions (correct -> wrong)
+    c = ((base_correct == 0) & (cand_correct == 1)).sum()   # fixes (wrong -> correct)
+    net = (c - b) / len(base_correct)
+    p = mcnemar_exact(b, c)                       # paired test on discordant pairs
+    return {"gross_flips": (b + c) / len(base_correct), "net_delta": net, "p": p}
+```
+Gross flips are often much larger than the net delta, and they show *which* items changed.
+
+## 7. Quantifying the accuracy loss of each optimization step
+
+**Principles:**
+- Start from a strong **FP16 reference** and change **one factor at a time**, with paired statistics on the same items.
+- Report the **per-step delta and the cumulative delta**. Effects are not additive (for example quantization × token reduction compounds on small text).
+- **Measure on the deployed artifact on the device** (NPU numerics, Q11, Q13).
+- Pair each delta with the **latency, energy and memory gain** to get an "accuracy lost per ms or MB saved" cost–benefit.
+- Do **flip analysis** (which items go from correct to incorrect) to find the failure categories and fix them specifically.
+- Use **leave-one-in and leave-one-out** ablations by component (Q11), and accuracy-vs-token curves per slice (Q2).
+
+**Illustrative ladder (assumed numbers, not measurements):**
+
+| Step | Overall Δ (pts) | Small-text OCR Δ | Low-light Δ | Hindi OCR CER Δ | POPE-F1 Δ | Gain |
+|---|---|---|---|---|---|---|
+| Token reduction (fewer tiles, pixel-shuffle r=4) | −0.8 | **−3.5** | −1.0 | +1.2 | −0.3 | TTFT −120 ms |
+| LLM INT4 (AWQ, g128) | −0.6 | −0.8 | −0.9 | +0.6 | −0.4 | Memory −2.2 GB, faster decode |
+| Vision encoder W8A8 | −0.5 | −1.5 | −0.7 | +0.9 | −0.2 | Encoder ~2x faster |
+| KV-cache INT8 | −0.1 | −0.1 | −0.1 | +0.1 | 0.0 | KV memory halved |
+| QAT / distillation recovery | +0.7 | +1.4 | +0.6 | −0.5 | +0.2 | None (accuracy recovery) |
+| Speculative decoding | 0.0 (verify) | 0.0 | 0.0 | 0.0 | 0.0 | Decode faster |
+| **Measured combined** | **−1.4** (vs sum −1.3: non-additive) | | | | | |
+
+**Notes:**
+- Each optimization hurts a **different slice** most: token reduction hits small text, encoder quantization hits fine detail, vocabulary pruning would hit Indic languages. An average hides this.
+- Speculative decoding is lossless in principle (Q15), but numerics can flip near ties, so verify equality.
+- Allocate an **accuracy budget** (for example, 2 points total, with no slice losing more than X) across steps by cost-effectiveness.
+- Include the **adaptive operating levels** (Q16): report accuracy at each level, not just L0.
+
+## 8. A/B testing and online evaluation
+
+**Offline vs online:** offline suites don't capture real usage. Online metrics: task success, engagement and retention, corrections, time to answer, deferral rate (Q17), crash and ANR rate, **battery impact, thermal events**, experienced p95 latency, complaints.
+
+**On-device specifics:**
+- **OTA delivery** of a ~1 GB artifact means staged rollouts and download costs.
+- **Stratify randomization** by device tier, chipset and region (Simpson's paradox across device tiers is real).
+- Define the **eligible population** (devices with a usable NPU) to avoid survivorship bias.
+- Run **at least 2 weeks** to avoid novelty effects.
+- **Privacy-preserving telemetry:** minimal, opt-in, on-device aggregation, differential privacy or federated analytics where possible. Telemetry can arrive late when devices are offline.
+- Rare failures need huge samples, so use **guardrail metrics with sequential testing** (always-valid p-values or mSPRT), CUPED-style variance reduction, and heterogeneous-effect analysis by slice (for example Hindi users).
+
+**Rollout:** shadow mode first (run the new model silently on a sampled subset and compare, mindful of the energy cost), then staged exposure (1% → 5% → 25% → 100%) with **auto-rollback** and a **kill switch**. For ranking and search features, **interleaving** is more sensitive than a plain A/B test.
+
+**Metric hierarchy:** one north-star metric (task success), supporting metrics, and guardrails (privacy violations = 0, crash rate, battery drain, thermal incidents, safety escalations). Pre-register them to avoid p-hacking.
+
+**Human evaluation program:** side-by-side pairwise preference by trained raters, with rubrics and gold questions, rater calibration and agreement monitoring, **native-language raters** for Hindi and other languages, and a mix of expert and crowd raters.
+
+## 9. Blueprint: on-device scene understanding on a phone camera
+
+| Suite | Size (example) | Metrics | Cadence | Gate |
+|---|---|---|---|---|
+| S0 parity and unit tests | A few hundred | Pass/fail | Every commit | Hard |
+| S1 public sanity (MMBench, TextVQA, DocVQA, OCRBench, POPE subsets) | 1 to 2k | Score vs baseline | Nightly | Within ±δ |
+| S2 product golden set (6 tasks) | 3 to 5k | Per-task metrics | Nightly | Non-inferiority |
+| S3 slice suite (tagged real captures: low light ~500, blur ~500, rotation ~400, occlusion ~400, small objects ~500, each of Hindi, Tamil and Bengali OCR ~400, Hinglish queries ~400, screen photos ~300) | ~4 to 5k | Per-slice metrics with CIs | Weekly and release | Worst-slice criteria |
+| S4 safety, hallucination, abstention, prompt injection, privacy | 1 to 2k | Recall at fixed FPR, abstention, leakage | Every build | **Hard** |
+| S5 system metrics on a device farm | Fixed workloads | Latency, energy, memory, sustained throughput | Nightly | Relative gates |
+| S6 human pairwise evaluation | 300 to 500 comparisons | Win rate, rater agreement | Per release | Advisory + gate |
+| S7 online | Staged rollout | Success, guardrails | Continuous | Auto-rollback |
+
+**Governance:** a named evaluation owner, a review process and changelog for evaluation sets, no training on evaluation data (Q8), restricted access to the hidden gate set, an internal leaderboard, and tracking of "evaluation debt" (stale sets, uncovered slices).
+
+## 10. Strong interview answer
+> "Public benchmarks like MMMU, MMBench, TextVQA, DocVQA, ChartQA, OCRBench and POPE measure curated, mostly English, high-resolution, multiple-choice or short-answer tasks on FP16 models, with no latency or energy. I'd keep them as regression tripwires, but ship on a layered suite. L0 is parity tests. L1 is public sanity checks. L2 is a product golden set from real device captures, stratified and versioned, built from the spec, with task-specific metrics: ANLS and CER for OCR (grapheme-level for Indic scripts), IoU for grounding, Recall@K and nDCG for visual search, claim-level factuality for descriptions, selective accuracy for abstention, and severity-weighted errors and false alarms per day for safety. L3 is slices: low light, blur, rotation, occlusion, small objects, screens, each Indic script reported separately with native-speaker labels, Hinglish queries, device tier, thermal and routing state. I'd report per-slice confidence intervals and a worst-slice criterion, sized for power: roughly 1,600 paired items to detect 2 points overall, and 300 to 500 per gating slice. LLM judges are for open-ended answers only, and I'd mitigate position, length and self-preference bias, judge hallucination and weaker Indic performance by swapping positions, using checklists and grounded metadata, ensembles, pinned versions, calibration against human labels per slice, and judge unit tests. For regression, I'd use paired McNemar or bootstrap tests, non-inferiority margins, hard gates on safety and format, deterministic decoding, a golden-failure set, cross-backend runs, and drift monitoring. For each optimization step, I'd run a one-factor-at-a-time ladder from an FP16 reference on the deployed artifact, report per-slice deltas, flip analysis and the latency, energy and memory gain, because losses are non-additive and land on different slices. Online, I'd use shadow mode, stratified staged A/B with guardrails like battery, thermal and privacy, sequential testing, interleaving for search, and human pairwise evaluation, with auto-rollback."
+
+## 11. Follow-up questions to prepare for
+1. Why can't a benchmark average decide whether to ship, and what replaces it?
+2. How many paired items do you need to detect a 2-point improvement, and what does the number depend on?
+3. How would you check that an LLM judge is trustworthy for Hindi answers?
+4. Why is grapheme-level CER the right metric for Indic OCR, and what Unicode pitfalls matter?
+5. How would you separate the accuracy impact of quantization from token reduction when they interact?
+6. What is a non-inferiority test, and why is it better than "no significant difference" for regression gates?
+7. How do you design an A/B test for an on-device model delivered by OTA across heterogeneous devices?
+8. How would you discover failure slices you didn't think of in advance?

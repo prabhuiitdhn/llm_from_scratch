@@ -1625,3 +1625,1046 @@ def gate(cand, base):
 6. How would you auto-generate POPE-style probes for attributes and relations from a simulator's scene graph?
 7. Why do CHAIR and POPE miss some hallucinations, and what would you add for long-form outputs?
 8. How would you design abstention so the model says "can't tell" without becoming useless?
+
+---
+
+# Q10: Distillation for small VLMs
+
+**Question:** How would you distill a 70B+ teacher into a ≤2B student? Cover logit distillation vs feature or attention-map distillation vs sequence-level distillation, and distilling the vision tower. How do you handle tokenizer or vocabulary mismatch between teacher and student? What are the limits of distillation relative to training small models on more tokens?
+
+Cost and compute figures are order-of-magnitude illustrations. Paper details (ULD, MiniLLM, GKD, Distillation Scaling Laws and others) are from memory, so check them before quoting.
+
+## 0. Framing
+- **Teacher:** a large VLM such as Qwen2.5-VL-72B, InternVL-78B or Llama-3.2-90B-Vision. It may also be a text-only LLM plus a separate vision teacher.
+- **Student (≤2B):** a small vision encoder (SigLIP-B-class, about 90M), a projector (pixel-shuffle MLP), and a 0.5 to 1.5B LLM.
+- **What you are transferring:** reasoning style, OCR and grounding skill, output format, calibration. It is **not** unlimited world knowledge (see section 5).
+- There are three places to distill: the **LLM's outputs** (sequence or logits), the **internal representations** (features, attention) and the **vision tower**.
+
+## 1. The three levels of LLM distillation
+
+### 1.1 Sequence-level (black-box) distillation
+The teacher generates responses (captions, QA, rationales) for images and prompts. The student is trained on them with ordinary cross-entropy.
+- **Pros:**
+  - Works with any teacher, even an API model or one with a different tokenizer.
+  - Simple and scales well.
+  - Most open small VLMs are built mainly this way (LLaVA-style GPT-generated data, ShareGPT4V, Cambrian, and others).
+- **Cons:**
+  - One sample per prompt, so it loses the teacher's full distribution ("dark knowledge").
+  - It inherits teacher errors and hallucinations.
+  - License limits on teacher outputs (Q8).
+- **Improvements:**
+  - Rationale (CoT) distillation, but keep the length bounded because long outputs cost latency on-device.
+  - Rejection sampling with a verifier, and multi-teacher consensus (Q8).
+
+### 1.2 Logit (token-level, white-box) distillation
+Match the student's next-token distribution to the teacher's at every position.
+
+```python
+def kd_loss(student_logits, teacher_topk_idx, teacher_topk_logp, labels, tau=1.0, alpha=0.5):
+    # student_logits: (B, T, V); teacher_*: top-k cached from the teacher, shape (B, T, k)
+    logp_s = torch.log_softmax(student_logits / tau, dim=-1)
+    logp_s_k = logp_s.gather(-1, teacher_topk_idx)                  # student log-probs on teacher's top-k
+    p_t = torch.softmax(teacher_topk_logp / tau, dim=-1)            # renormalized over top-k
+    kl = (p_t * (torch.log(p_t + 1e-9) - logp_s_k)).sum(-1).mean() * tau**2
+    ce = F.cross_entropy(student_logits.flatten(0, 1), labels.flatten(), ignore_index=-100)
+    return alpha * ce + (1 - alpha) * kl
+```
+
+- **Why it is stronger:** the full distribution carries many more bits per token than one sampled token. It encodes near-ties ("red" vs "orange") and uncertainty. This makes it far more **sample-efficient**.
+- **Costs:**
+  - You need a teacher forward pass for every training token.
+  - Storing full 150k-vocabulary logits is impractical, so people cache **top-k** (e.g. k = 20 to 100) probabilities and renormalize, or bucket the tail.
+- **Which divergence:**
+  - **Forward KL** (teacher || student) is mean-seeking. A small student then spreads probability over many modes, which can produce odd in-between outputs.
+  - **Reverse KL** (MiniLLM) is mode-seeking and often better for generation with limited capacity.
+  - JSD and skew-KL variants (DistiLLM) trade off between them.
+  - **GKD (generalized KD)** trains on **student-generated** sequences scored by the teacher (on-policy). This fixes the train-test mismatch (exposure bias) of offline data.
+- **Temperature:** τ softens both distributions, with a τ² factor on the KL term. Typical τ is 1 to 2.
+- **Offline vs online:** offline (cached teacher outputs on a fixed dataset) is cheaper but off-policy. Online teacher scoring is better but costs more compute.
+
+### 1.3 Feature and attention-map distillation
+Match intermediate representations: hidden states (MSE or cosine, through a learned linear map because the dimensions differ) or attention distributions and value relations (MiniLM / TinyBERT style).
+- **Layer mapping:** the student has fewer layers, so map each student layer i to a teacher layer g(i) (uniform spacing or last layers only).
+- **Dimension-agnostic option:** MiniLM-style distillation matches attention distributions and value-relation matrices, which don't depend on hidden size or head count.
+- **Pros:** dense supervision and faster convergence.
+- **Cons:** extra design choices (layer mapping, projections, loss weights), more memory (you must keep hidden states), it can over-constrain the student, and gains at LLM scale are usually modest compared with logit distillation.
+
+### Comparison
+
+| Level | Needs same tokenizer? | Teacher access | Signal richness | Cost | Best use |
+|---|---|---|---|---|---|
+| Sequence-level | No | Any (even an API) | Low | Teacher generation | Default starting point, cross-family teachers |
+| Logit KD | **Yes** (or alignment) | Weights / logits | High | Teacher forward per token (cacheable as top-k) | Same-family teacher, data-limited regimes |
+| Feature / attention KD | No (but needs layer and dim mapping) | Weights | Dense, structural | Memory, tuning | Vision tower, early convergence |
+
+## 2. Distilling the vision tower
+
+**Why do it:** a small student encoder (SigLIP-B, MobileCLIP, FastViT, EfficientViT) can inherit capabilities of much bigger encoders (InternViT-6B, EVA-CLIP, SigLIP-SO400M, DINOv2-g, SAM) using only **unlabeled images**, which is cheap and label-free.
+
+**Methods:**
+- **Patch-token feature distillation:** match student patch tokens to teacher patch tokens (MSE, cosine or smooth-L1) after aligning the spatial grid, with a linear head for dimension mismatch.
+- **Global and affinity distillation:** match the image-text similarity matrix or embeddings (CLIP-KD, TinyCLIP's affinity mimicking with weight inheritance).
+- **MobileCLIP "reinforced" data:** precompute and store teacher embeddings and synthetic captions once in the dataset, then reuse them for every training run. This amortizes the teacher cost.
+- **Agglomerative multi-teacher distillation (e.g. AM-RADIO):** one small encoder learns from several teachers at once (CLIP-type for semantics, DINOv2 for dense features, SAM for segmentation).
+- **Task-specific distillation:** EfficientSAM, TinySAM and EdgeSAM distilled from SAM.
+- **Token alignment:** if the student sees fewer tokens or lower resolution, pool the teacher's feature map to the student's grid (adaptive average pooling).
+
+**End-to-end output distillation also reaches the vision tower:** training the student VLM against teacher logits sends gradients into the student's encoder. The common sequence is:
+1. Feature-distill the vision tower from the teacher encoder(s) on unlabeled images.
+2. Align the projector (Q6 stage 1).
+3. Run end-to-end logit or sequence distillation.
+
+**Resolution trap:** if the teacher sees a high-resolution image and the student sees a low-resolution one, the student is asked to produce details it cannot see. It learns to **guess**, which becomes hallucination (Q9). Keep the input gap small, or only keep teacher answers that can be verified at the student's resolution.
+
+## 3. Tokenizer and vocabulary mismatch
+
+**The problem:** logit KL needs the same sequence of tokens and the same vocabulary. For example, a Qwen teacher has about 152k tokens and a student like SmolLM2 has about 49k.
+
+**Options, from most to least practical:**
+1. **Choose a student in the same family and tokenizer as the teacher.** This is the best practical fix.
+   - Example: Qwen2.5-VL-72B → a Qwen2.5-0.5B/1.5B-based student.
+   - Meta reported that the Llama 3.2 1B/3B models used logits from larger Llama 3.1 models during pretraining, and Google reported distilling Gemma 2's smaller models from a larger teacher.
+2. **Sequence-level only.** Decode the teacher's text and re-tokenize it with the student's tokenizer. This is tokenizer-agnostic.
+3. **Cross-tokenizer logit alignment:**
+   - **Universal Logit Distillation (ULD)** uses an optimal-transport-style loss between probability distributions, so no token alignment is needed.
+   - **Minimum-edit-distance alignment** (as in FuseLLM-style work) aligns tokens across tokenizers and then fuses distributions.
+   - **Dual-space KD (DSKD)** projects hidden states into each other's output spaces.
+   - A practical fallback is to align at **word or character boundaries** and match the probability of each word, falling back to sequence-level when alignment fails.
+4. **Vocabulary transplant on the student:** swap in the teacher's vocabulary and initialize the new embeddings (for example, from the mean embedding of each token's old sub-tokens). This works, but you must retrain, and a bigger vocabulary inflates the student's embedding and LM head (see Q1 deep dive, section 5).
+5. **Restrict to a shared vocabulary subset:** if you prune the vocabulary for target languages (also an edge optimization), restrict the teacher's distribution to the retained tokens and renormalize.
+
+**Multimodal-specific details to align:**
+- **Special tokens:** image placeholders, chat-template tokens.
+- **Coordinate and box formats:** location tokens or normalized ranges (e.g. 0 to 1000) must match, or you convert at the sequence level.
+- **Multiple teachers with different tokenizers:** use sequence-level data or ULD-style losses.
+
+## 4. A recipe for a 70B+ teacher → ≤2B student
+1. **Choose the student:** vision tower (SigLIP-B-class), same-family LLM, pixel-shuffle projector, with the token budget and resolution fixed up front (Q2, Q6).
+2. **Vision tower distillation (optional):** feature and affinity losses from the teacher encoder(s) on unlabeled images.
+3. **Alignment:** projector training as in Q6 stage 1.
+4. **Main distillation:** diverse prompts (image + instruction) → teacher responses, filtered with verifiers (Q8). Train with CE, plus **top-k logit KL** if the tokenizers match. Cache teacher top-k offline.
+5. **On-policy refinement:** sample from the student, then either get teacher logits on the student's sequences (GKD) or use the teacher as a judge to rank student outputs for DPO-style training (Q9). Mine hard examples (Q8).
+6. **Compression-aware stage:** quantization-aware training, with the FP16 student as the "teacher" (self-distillation) for the quantized student (Q11).
+7. **Evaluate per capability:** OCR, grounding, reasoning, hallucination, calibration, and teacher-student agreement, with a text-only regression check.
+
+**Combined loss:** `L = λ1·CE + λ2·τ²·KL(logits) + λ3·L_feat(vision) + λ4·L_hidden`, with the weights ramped or scheduled (for example, feature loss early and fading out).
+
+### Compute accounting (illustrative)
+- Teacher forward per token ≈ 2 × 70B = 140 GFLOP. Student training per token ≈ 6 × 1.5B = 9 GFLOP. The **teacher's forward pass is about 15x the student's training step per token.**
+- For 10B tokens: teacher forward ≈ 1.4e21 FLOPs, on the order of **1,000 H100-hours** at realistic utilization.
+- Storing top-20 (index + probability) for 10B tokens ≈ 1.2 TB.
+- This is why people use **offline top-k caching**, **sequence-level data** and **reused teacher artifacts** (the MobileCLIP idea).
+
+## 5. Limits of distillation vs training small models on more tokens
+
+1. **Capacity gap.** A student can't mimic a teacher that is far beyond its capacity, and a much stronger teacher doesn't always give a better student. A "teacher assistant" of intermediate size can help.
+2. **Distillation doesn't add parameters.** Long-tail world knowledge, rare facts and fine-grained recognition scale with parameter count. Distillation transfers skills, style, formats and calibration much better than raw knowledge.
+3. **The student can't exceed the teacher,** and inherits its hallucinations, biases, refusal behavior and mistakes.
+4. **Information gap between the teacher's and the student's input** (resolution, token budget). The student can't learn what it cannot see (section 2).
+5. **Scaling evidence.** The "Distillation Scaling Laws" work reported that distillation beats supervised training only under certain conditions: the teacher already exists (so its cost is amortized) and the compute budget is not huge. With enough tokens and compute, plain supervised training of the small model catches up or wins. Count the teacher's inference and data-generation compute honestly.
+6. **The alternative is over-training small models.** Small models like Qwen2.5-0.5B and SmolLM2 were trained on trillions of tokens, far beyond Chinchilla-optimal, because inference cost is what matters. Distillation improves **data efficiency**, and the two are complementary: Gemma 2 and Llama 3.2 used distillation inside large-token training runs.
+7. **Reasoning distillation can inflate latency.** Long CoT traces cost decode time on-device. Prefer short rationales, or distill the final answers plus compact reasoning.
+8. **Always run the ablation** "same tokens with ground-truth labels vs distilled", and measure the gain per unit of total compute including the teacher.
+
+## 6. Strong interview answer
+> "I'd treat it as three layers. For the LLM, sequence-level distillation is the default: the teacher generates verified responses, which works across tokenizers and even for API teachers, but it loses the full distribution. If the student shares the teacher's tokenizer, I'd add token-level logit KL, cached offline as top-k, because the full distribution carries far more signal per token. I'd consider reverse KL or GKD-style on-policy distillation to fix exposure bias, since a small student can't cover all the teacher's modes. For the vision tower, I'd feature-distill a small encoder from the big teacher encoders on unlabeled images, possibly multi-teacher in the AM-RADIO style, then align the projector and finish with end-to-end distillation. I'd keep the teacher and student inputs matched, because a student can't learn details it cannot see, and it will hallucinate instead. For tokenizer mismatch, the cleanest fix is a same-family student, like Qwen-VL-72B to a Qwen-0.5B/1.5B student. Otherwise I'd use sequence-level data, ULD or edit-distance alignment, or vocabulary transplant at some retraining cost, and I'd watch special tokens and box formats. The limits are real: the capacity gap, the fact that distillation moves skills better than long-tail knowledge, the student inheriting teacher errors, and the cost accounting. The teacher's forward pass is roughly 15x the student's training step per token, and distillation scaling work says that with a big enough budget plain supervised training of the small model can match it. So I'd use distillation to improve data efficiency within an already token-rich recipe, and I'd always ablate against ground-truth-label training on the same tokens."
+
+## 7. Follow-up questions to prepare for
+1. Why is forward KL mean-seeking and reverse KL mode-seeking, and which is better for a small student?
+2. What is exposure bias in offline distillation, and how does GKD fix it?
+3. How does top-k truncation of teacher logits bias the student, and how do you reduce that bias?
+4. Why do MiniLM-style attention-relation losses not need matching hidden sizes?
+5. How do you distill from a teacher with a different tokenizer when you cannot change the student's tokenizer?
+6. Why does a much stronger teacher sometimes produce a worse student?
+7. How would you measure whether distillation helped beyond just training on the same tokens with ground truth?
+8. How do you distill a vision encoder so that the student works at a lower resolution than the teacher without learning to hallucinate?
+
+---
+
+# Q11: Quantization in depth
+
+**Question:** Compare PTQ vs QAT, weight-only (W4A16, GPTQ, AWQ) vs weight+activation (W8A8, SmoothQuant) and KV-cache quantization (INT8/INT4/FP8). Why are vision encoders and projectors usually more sensitive to quantization than the LLM? How do activation outliers affect INT8 NPUs? How would you diagnose a layer-wise accuracy collapse and fix it with mixed precision?
+
+Method descriptions are from the papers as I remember them. Hardware support (INT4, FP8, per-token scales) varies by NPU and toolchain, so verify against your target's documentation.
+
+## 0. The basics you need to state first
+
+**Affine quantization:** `q = clamp(round(x / s) + z)`, and `x̂ = s · (q − z)`.
+
+**Choices that define a scheme:**
+
+| Choice | Options |
+|---|---|
+| **What** is quantized | Weights, activations, KV-cache, embeddings and LM head |
+| **Granularity** | Per-tensor, per-channel (weights), per-group (e.g. 32/64/128 values), per-token (activations), per-block (microscaling formats) |
+| **Symmetry** | Symmetric (z = 0) or asymmetric |
+| **Activation scales** | Static (calibrated offline) or dynamic (computed at runtime) |
+| **Format** | INT8, INT4, FP8, NF4, MX formats |
+
+**Why quantize, and what it actually speeds up:**
+- **Decode is memory-bandwidth-bound.** Each token reads all the weights, so fewer bytes per weight means faster decode. This is why **weight-only** INT4 helps decode.
+- **Prefill and the vision encoder are compute-bound.** Weight-only quantization does not reduce their compute, because the weights are dequantized back to a higher precision before the matmul. To use the integer MAC arrays you need **integer activations too (W8A8)**.
+- So: weight-only quantization targets decode and memory, and W8A8 targets prefill and the encoder.
+
+**One hardware rule worth memorizing:** quantization scales can only vary along dimensions that are **not** reduced in the matmul. That means per-output-channel for weights and per-token (row) for activations. A per-input-channel activation scale cannot be factored out of the accumulation sum, so integer hardware can't do it efficiently. This is why activation outliers across channels are so hard.
+
+## 1. PTQ vs QAT
+
+### PTQ (post-training quantization)
+- No or minimal training. You run a small **calibration set** (about 128 to 1,024 samples) to find activation ranges and, in some methods, to correct the weights.
+- **Calibration of ranges:** min/max, percentile, MSE-minimizing, or entropy (KL) based.
+- **Learned PTQ:** AdaRound and BRECQ (learned rounding), OmniQuant (learned clipping and equivalent transforms).
+- **Pros:** fast, cheap, no training pipeline.
+- **Cons:** can collapse at ≤4 bits or with strong outliers. Small models usually have less redundancy and are generally more sensitive than large ones.
+
+### QAT (quantization-aware training)
+- Simulate quantization in the forward pass (**fake-quant**), and use the straight-through estimator for the backward pass. The weights, and often the scales (LSQ-style learnable step sizes), adapt to the quantization noise.
+- **For LLMs and VLMs:** LLM-QAT (data-free, uses self-generated data), EfficientQAT, and distillation-based QAT where the FP16 model is the teacher (Q10).
+- **Pros:** recovers accuracy at 4-bit weights and W4A8.
+- **Cons:** needs data and compute. For a ≤2B model this is affordable.
+
+### Decision rule
+Start with PTQ. If the gates fail (accuracy, OCR, hallucination), escalate in steps: better calibration → equivalent transforms or rotations → learned clipping → targeted QAT on the offending parts. For a small model aimed at INT4 or W4A8, plan for QAT in the last stage (Q6 stage 4).
+
+## 2. Weight-only quantization (W4A16 family)
+
+- **RTN with groups:** round-to-nearest with per-group scales (group size 32 to 128) is the baseline. Each group stores a scale, and optionally a zero-point.
+- **GPTQ:** layer-wise, second-order. It quantizes weights column by column and updates the remaining columns to minimize the layer's output error `‖WX − ŴX‖²`, using the Hessian estimated from calibration activations. Strong at 3 to 4 bits. **Risk:** it can overfit to the calibration distribution, so calibrate a VLM with multimodal data.
+- **AWQ:** activation-aware. A small fraction (~1%) of weight channels are "salient", determined by activation magnitude. AWQ scales those channels before quantization so they lose less precision (`W·diag(s)` and `X/diag(s)`, an equivalent transform). No backprop, kernel-friendly (no mixed precision inside a layer), and often generalizes better than reconstruction-based methods.
+- **Others:** SqueezeLLM (non-uniform codebooks plus sparse outliers), QuIP# and AQLM (vector quantization, down to about 2 bits), HQQ (data-free), NF4 from bitsandbytes (QLoRA), GGUF k-quants for llama.cpp.
+
+**Size arithmetic (1.5B parameters):** FP16 ≈ 3 GB, INT8 ≈ 1.5 GB, INT4 with group 128 ≈ 4.25 to 4.5 bits per weight including scales (and zeros), about 0.8 GB.
+
+**Limits:** weight-only doesn't speed up the compute-bound parts. On NPUs, check kernel support. In some stacks "W4A16" means INT4 weights with **INT16** activations (Qualcomm-style), not FP16.
+
+## 3. Weight + activation quantization (W8A8 and beyond)
+
+**W8A8:** INT8 weights (per output channel) and INT8 activations (per-tensor static, or per-token dynamic). It is the standard NPU path because INT8×INT8 uses the integer MAC arrays.
+
+**The activation-outlier problem:**
+- Transformer activations have **a few channels with magnitudes 10 to 100x larger** than the rest (systematic outlier channels, and "massive activations" on certain tokens).
+- With per-tensor INT8, `s = max|x| / 127`. One outlier forces a large step size, so the typical values round to only a few levels. The **effective precision of normal channels falls to 2 to 3 bits**.
+- This tends to appear at the inputs to `down_proj`/`fc2`, the residual stream, LayerNorm outputs and some attention outputs.
+
+**SmoothQuant:** migrate difficulty from activations to weights. With a per-channel factor `s_j = max|X_j|^α / max|W_j|^(1−α)` (α ≈ 0.5), compute `X' = X / s`, `W' = s · W`. It is mathematically equivalent and the division is folded into the preceding LayerNorm or linear weights, so there is **no runtime overhead**.
+
+**Rotation-based methods (QuaRot, SpinQuant):** multiply by (random or learned) Hadamard-like rotations that spread outliers evenly over channels, so activations become easier to quantize. Rotations can be fused into the weights, and this makes W4A8 and even W4A4 more feasible. Other tools: OmniQuant (learnable clipping and transforms), PrefixQuant-style isolation of massive-activation tokens into a fixed prefix.
+
+**Static vs dynamic scales:**
+- **Static per-tensor** is the most NPU-friendly but the least accurate. Unseen inputs (night images, unusual UIs) can **saturate** it (clipping).
+- **Per-token dynamic** is more accurate but needs runtime reductions, and not every NPU supports it.
+
+**FP8:** E4M3/E5M2 are an option on recent GPUs. Most mobile NPUs don't support FP8, so verify. Microscaling (MX) formats are emerging.
+
+## 4. KV-cache quantization
+
+- **What:** store K and V in INT8, FP8 or INT4 instead of FP16.
+- **INT8** is usually close to lossless (per-token or per-head scales).
+- **Lower bits:**
+  - **KIVI:** keys have outlier channels, so quantize K per-channel and V per-token, and keep a recent window in full precision.
+  - **KVQuant:** per-channel keys quantized before RoPE, non-uniform codebooks, and dense-and-sparse handling of outliers.
+- **When it matters:** the benefit is largest for long context, many visual tokens, video, or non-GQA models. For a small GQA LLM at short context, the cache is small (about 28 KB per token for Qwen2.5-1.5B, Q5 deep dive), so weights and activations matter more.
+- **Risks:**
+  - Errors accumulate across long contexts.
+  - Visual tokens have different K/V statistics from text tokens, so test on long multimodal tasks.
+  - Keep attention-sink tokens and the most recent tokens in higher precision if you go to INT4.
+
+## 5. Why vision encoders and projectors are more sensitive
+
+These are commonly observed effects with plausible mechanisms. Verify them on your own model.
+
+1. **Activation structure in ViTs.** ViTs show high-norm outlier tokens (the "artifacts" that motivated register tokens), large inter-channel variance at LayerNorm inputs, post-GELU asymmetry, and **post-softmax attention maps with long-tailed values in [0, 1]**. Uniform INT8 wastes range on these (FQ-ViT-style work uses log2 quantizers and special handling for LayerNorm and softmax).
+2. **Continuous outputs with no discrete "absorber."** The LLM ends in a softmax over the vocabulary, where small perturbations often don't change the chosen token. Vision features and projector outputs are continuous vectors consumed directly downstream, so noise passes straight through, and accumulates over 12 to 27 layers.
+3. **Less redundancy.** A 90M to 400M encoder has far fewer parameters than a 1.5B LLM to absorb noise.
+4. **Fine detail is fragile.** OCR, small objects and counting depend on subtle feature differences. Quantization noise acts like blur on features, so fine detail disappears first.
+5. **The projector's output must match what the LLM expects.** Projector outputs are injected where word embeddings would be. The LLM's embedding table is a well-conditioned lookup, but projector outputs are continuous, so a small scale or distribution shift can disrupt the LLM. The pixel-shuffle projector's first layer also has a very large fan-in (for example 10k inputs), which gives a wide accumulation range.
+6. **Poor memory trade.** The projector is only a few million parameters, so quantizing it saves almost nothing. The encoder is small in memory too, but heavy in compute. This creates a tension: you want integer activations for encoder speed, which is exactly where the outliers hurt.
+7. **Calibration mismatch.** The calibration images must represent the product (text-heavy, low-light, screens). And for the **LLM**, visual tokens inside the LLM have different activation statistics from text tokens, so calibrate the LLM with **multimodal** data that includes visual tokens.
+
+## 6. Activation outliers on INT8 NPUs, in detail
+
+1. **Per-tensor step size problem** (section 3): one outlier channel wrecks the resolution for all the others.
+2. **The hardware constraint:** activation scales must be per-tensor or per-token. A per-channel activation scale can't be factored out of the reduction, so the hardware can't do it. SmoothQuant and rotations work around exactly this limitation.
+3. **Mixed precision partitioning:** many NPUs run LayerNorm/RMSNorm, softmax, GELU/SiLU and RoPE in FP16/INT16, or fall back to the CPU/DSP. Each precision boundary adds quantize/dequantize operations and memory traffic.
+4. **INT16 activations (A16)** are an alternative for sensitive layers: much better accuracy, at 2x the activation memory traffic.
+5. **Static calibration risk:** a range that was fine on calibration data may clip on a new input. Clipping errors are often catastrophic (saturated attention or garbage features), so monitor the saturation rate.
+6. **Mitigations:** SmoothQuant folding, Hadamard rotations, percentile or MSE-based clipping (trading clipping error against rounding error), keeping outlier-prone layers at higher precision, per-token dynamic scales where supported, learned clipping in QAT, and training-time techniques that avoid outliers ("quantizable transformers" ideas such as clipped softmax and gated attention).
+
+## 7. Diagnosing a layer-wise accuracy collapse
+
+**Step 1: Fix a baseline.** Run the FP16 model on a golden set, and define both task metrics (accuracy, OCR, POPE) and numerical metrics (cosine similarity, SQNR or MSE of intermediate activations, KL of the final logits against FP16).
+
+**Step 2: Bisect by component.** Quantize only one component at a time (vision encoder, projector, LLM, embedding and LM head), and also do the reverse (everything quantized except one). This locates the collapse quickly.
+
+**Step 3: Layer and op sensitivity sweep.** Quantize one layer or op type at a time, with everything else at FP16, and measure the change in metric. You can also use a Hessian-based sensitivity score (HAWQ-style). Rank layers by sensitivity.
+
+```python
+def sensitivity_sweep(model, layers, eval_fn, quantize_layer):
+    base = eval_fn(model)                       # FP16 baseline metric (higher is better)
+    scores = {}
+    for name in layers:
+        with quantize_layer(model, name):       # quantize only this layer, restore on exit
+            scores[name] = base - eval_fn(model)
+    return sorted(scores.items(), key=lambda kv: -kv[1])   # most sensitive first
+```
+
+**Step 4: Look at activation statistics.** Per-layer histograms, max/median ratio, kurtosis, per-channel ranges. A large outlier ratio at a layer's input is a strong hint. Focus on `down_proj`/`fc2` inputs, the residual stream, LayerNorm outputs, softmax outputs and the projector's input.
+
+**Step 5: Track error propagation.** Run FP16 and quantized models side by side with hooks, and plot the cosine similarity of hidden states against depth. A sharp drop at one layer means a local problem. A gradual slide means compounding error.
+
+**Step 6: Check calibration.** Is the calibration set representative (visual tokens, text-dense images, low-light)? Measure the saturation rate on held-out inputs.
+
+**Step 7: Rule out non-quantization bugs.**
+- Wrong scale folding or per-channel axis.
+- Fused LayerNorm/BN mistakes.
+- Residual adds of two tensors with different scales that need rescaling.
+- **Attention mask values** (-1e9 can't be represented in FP16 or INT ranges, so use a representable large negative, e.g. -65504 for FP16 or a safe fixed value).
+- **FP16 overflow:** massive activations above 65,504 become inf.
+- RoPE tables accidentally quantized.
+- Padding tokens not masked.
+
+**Step 8: Fix, from cheapest to most expensive.**
+1. Better calibration (percentile or MSE clipping, more diverse data, per-channel weights).
+2. Equivalent transforms: SmoothQuant or AWQ scaling, rotations.
+3. Finer granularity: group size 64 or 32, per-token dynamic scales.
+4. **Mixed precision:** keep the most sensitive layers or ops at higher precision (INT8, INT16 activations or FP16), under a size and latency budget. Treat it as a budgeted optimization: maximize accuracy subject to size ≤ M and latency ≤ T, using a greedy "sensitivity per byte" ordering or an ILP/search (HAQ/HAWQ-style).
+5. Targeted QAT or learned clipping with distillation from FP16, on only the offending parts.
+6. Architecture or training changes to reduce outliers (registers, clipped softmax, replacing awkward activations with NPU-friendly ones).
+
+**Step 9: Validate on the device.** NPU numerics (fixed-point requantization, lookup tables for nonlinear ops, rounding) can differ from the simulator. Dump intermediate tensors from the device and compare layer by layer against the simulator and FP16.
+
+## 8. Example mixed-precision plan for a ~2B on-device VLM
+
+| Component | Precision | Reason |
+|---|---|---|
+| LLM linear layers | W4 (group 128, AWQ/GPTQ, or QAT), activations A8 with SmoothQuant, or A16 on NPUs that prefer it | Decode is bandwidth-bound |
+| `down_proj` in the first and last 2 layers | W8 | Most sensitive |
+| Vision encoder (SigLIP-B class) | W8A8, per-channel weights, LayerNorm/softmax/GELU in FP16 or INT16, patch-embed and last block FP16 | Compute-bound, outlier-prone |
+| Projector | FP16 or INT8 | Tiny, sensitive, no memory benefit from lower bits |
+| Embedding table / LM head (tied) | INT8 | Large vocabulary (Q1 deep dive, section 5), sensitive |
+| KV-cache | INT8 (per-token / per-head scales). If INT4, keep sink and recent tokens in FP16 | Matters for long context and video |
+| RoPE tables, norms | FP32/FP16 | Precision-sensitive |
+
+**Size estimate (illustrative):** LLM non-embedding 1.3B × ~4.5 bits ≈ 0.74 GB, embedding/LM head 233M × 1 byte ≈ 0.23 GB, encoder 90M × 1 byte ≈ 0.09 GB, projector in FP16 ≈ 0.04 GB. Total ≈ **1.1 GB**, versus about 3.8 GB in FP16.
+
+## 9. Evaluation notes
+- Perplexity is not enough. Evaluate **task accuracy, OCR, grounding and hallucination (POPE/CHAIR, Q9) on the deployed artifact**, with slices for low light and small text.
+- Measure **latency on the device**, not just size. INT4 can be slower in prefill if the runtime dequantizes inefficiently.
+- Quantization can erase small LoRA deltas (Q7), so re-evaluate fine-tuned models after quantizing.
+
+## 10. Strong interview answer
+> "I start with what each scheme speeds up. Decode is memory-bound, so weight-only INT4 with group scales (AWQ, GPTQ) cuts weight traffic. Prefill and the vision encoder are compute-bound, so they need W8A8 to use integer MACs. PTQ is the first step: calibrate, and use AWQ or GPTQ for weights. For activations, outlier channels make per-tensor INT8 collapse, since one outlier sets the step size and leaves the other channels with 2 to 3 effective bits. NPUs can only scale per-token or per-output-channel because per-input-channel scales don't factor out of the reduction, so I'd use SmoothQuant folding or Hadamard rotations, clipping, and higher precision for the outlier-prone ops. If PTQ gates still fail, I'd run QAT with the FP16 model as a distillation teacher. For KV-cache, INT8 is usually safe, INT4 needs KIVI-style handling and an FP window, and it matters mainly for long context and video. Vision encoders and projectors are more sensitive because of ViT outlier tokens and long-tailed softmax and LayerNorm statistics, continuous outputs with no discrete absorber, fewer parameters, fragile fine detail for OCR, and because the projector's output must match what the LLM expects. They also give little memory saving, so I keep them at INT8 or FP16. For a layer-wise collapse, I'd bisect by component, run a single-layer sensitivity sweep, inspect activation outlier ratios, track cosine similarity against depth, check calibration and non-quantization bugs like mask values and FP16 overflow, then fix with calibration, smoothing or rotation, finer granularity, budgeted mixed precision and targeted QAT. I'd confirm on the device, because NPU numerics differ from the simulator, and evaluate hallucination and OCR on the deployed artifact."
+
+## 11. Follow-up questions to prepare for
+1. Why can't an integer matmul use per-input-channel activation scales?
+2. Why does weight-only INT4 speed up decode but not prefill?
+3. How does SmoothQuant's α trade off between activation and weight quantization error?
+4. How do Hadamard rotations help, and why can they be fused into the weights?
+5. Why does GPTQ risk overfitting to its calibration data, and how does AWQ avoid it?
+6. Why is the KV-cache of a visual token different to quantize than a text token's?
+7. How do you pick which layers get higher precision under a memory budget?
+8. What differences between an NPU's numerics and a simulator could hide a bug?
+
+---
+
+# Q12: Latency anatomy of a VLM on-device
+
+**Question:** Break down end-to-end latency (image decode → preprocess → vision encoder → projector → prefill → decode). Which stages are compute-bound vs memory-bandwidth-bound on a mobile SoC? How do you measure and profile each stage, and which optimizations apply to which stage?
+
+All hardware numbers below are **hypothetical, flagship-class assumptions** (a 40 TOPS INT8 NPU and LPDDR5X at about 68 GB/s peak). They exist to show the reasoning. Replace them with measurements from your target device.
+
+## 0. The pipeline and the two headline metrics
+
+```
+camera / file → [1 image decode] → [2 preprocess: resize, tile, normalize]
+   → [3 vision encoder] → [4 projector] → [5 merge embeddings + positions]
+   → [6 LLM prefill] → first token ─── TTFT
+   → [7 decode loop: 1 token per step, sampling, detokenize, stream] ─── TPOT per token
+```
+
+- **TTFT** (time to first token) ≈ stages 1 to 6, plus the first sampling step.
+- **TPOT** (time per output token) = one decode step.
+- **E2E** = `TTFT + (n_out − 1) × TPOT`.
+
+**Key consequence:** for short answers, TTFT dominates (encoder + prefill). For answers longer than roughly 10 to 20 tokens, **decode dominates**, so output-length control is often the biggest lever on E2E latency.
+
+## 1. Stage by stage: resource, bound type, levers
+
+| # | Stage | Runs on | Bound by | Notes |
+|---|---|---|---|---|
+| 1 | Image decode (JPEG/HEIC, or YUV from the ISP) | HW decoder, CPU, ISP | Memory / fixed-function | A full-resolution photo is expensive to decode on CPU. YUV preview frames skip this |
+| 2 | Preprocess (resize, crop/tile, normalize, HWC→CHW, dtype) | CPU (NEON), GPU, ISP scaler, or fused into the NPU graph | **Memory-bound** (elementwise passes over pixels) | Often overlooked. Multiplied by the number of tiles |
+| 3 | Vision encoder (ViT) | NPU (INT8/FP16) | **Compute-bound** for the matmuls. **Memory-bound** for unfused elementwise ops and softmax | Cost ∝ tiles × FLOPs per tile |
+| 4 | Projector (MLP, pixel-shuffle) | NPU | Negligible compute | Real cost is **graph breaks, layout transposes, dtype conversions, CPU round-trips** |
+| 5 | Embedding merge, M-RoPE position IDs | CPU / NPU | Memory (copies) | Small, but avoid extra copies |
+| 6 | LLM prefill | NPU | **Compute-bound** when the chunk is large enough, memory-bound for small chunks | Cost ∝ N_total × params |
+| 7 | Decode | NPU (or GPU/CPU in some stacks) | **Memory-bandwidth-bound** | Reads all weights (+ KV) every token |
+| 8 | Sampling, detokenization, UI streaming | CPU | Latency / sync overhead | Top-k/top-p over a 150k vocabulary on CPU costs a few ms per token if not fused |
+
+### Roofline reasoning (why prefill is compute-bound and decode is not)
+For a weight matmul with M tokens in flight:
+- FLOPs = `2 · M · params`.
+- Bytes read ≈ `params × bytes_per_weight`.
+- Arithmetic intensity = `2M / bytes_per_weight` ops per byte (INT8: 2M, INT4: 4M).
+- Ridge point = peak ops ÷ effective bandwidth. With 40 TOPS and about 50 GB/s of effective bandwidth, that is about **800 ops/byte**.
+
+```python
+peak_tops, eff_bw = 40e12, 50e9
+ridge = peak_tops / eff_bw                       # ~800 ops/byte
+for bytes_per_w, name in [(1.0, "INT8"), (0.5, "INT4")]:
+    m_needed = ridge * bytes_per_w / 2           # tokens needed to become compute-bound
+    print(name, round(m_needed))                 # INT8 ~400, INT4 ~200
+```
+
+- **Prefill and the vision encoder** have M in the hundreds to thousands, so they sit **above the ridge** (compute-bound). Chunked prefill with chunks smaller than about 200 to 400 tokens leaves the NPU under-used.
+- **Decode** has M = 1. Its intensity is about 4 ops/byte for INT4, roughly **200x below the ridge**, so utilization is under 1% and speed is set purely by bytes read per second.
+- **Elementwise ops** (LayerNorm, GELU/SiLU, softmax, residual adds, quantize/dequantize) are memory-bound and can take a large share of encoder time if they are not fused.
+- Real utilization is typically **20 to 40% of the peak** even in the compute-bound stages.
+
+### Decode upper bound
+`tokens/s ≈ effective_bandwidth / bytes_read_per_token`.
+
+For a 1.5B-class LLM at INT4 (about 0.74 GB of transformer weights) plus an INT8 LM head (about 0.23 GB), that is about 1.0 GB per token. At about 40 GB/s of effective bandwidth (shared with the CPU, GPU, ISP and display), the ceiling is about **40 tokens/s**. Real systems are lower after dispatch overhead, dequantization, KV reads and sampling, so figure 15 to 30 tokens/s.
+
+## 2. Worked example (illustrative)
+Assumptions: a SigLIP-B/16 encoder at 512 px (about 0.2 TFLOP per tile), 4 tiles + 1 thumbnail, pixel-shuffle to 64 tokens per tile, a 1.5B LLM (1.3B non-embedding), an effective 10 TOPS on the NPU, and decode at 25 tokens/s.
+
+| Stage | Estimate | Reasoning |
+|---|---|---|
+| Image decode (HW, 12 MP) | ~25 ms | Fixed-function decoder |
+| Preprocess (5 tiles) | ~10 ms | Memory-bound resize and normalize |
+| Vision encoder | ~100 ms | 5 tiles × 0.2 TFLOP = 1 TFLOP at 10 TOPS |
+| Projector + merge | ~3 ms | Small, if there are no graph breaks |
+| Prefill | ~100 ms | ~380 tokens × 2 × 1.3B ≈ 1 TFLOP at 10 TOPS |
+| First-token step | ~40 ms | One decode step |
+| **TTFT** | **~280 ms** | |
+| Decode of 29 more tokens | ~1.16 s | 29 × 40 ms |
+| **E2E for a 30-token answer** | **~1.4 s** | Decode is about 80% of it |
+
+**Takeaways:**
+- With a sub-second E2E target (Q25), a 30-token answer does not fit at this decode speed. You must **shorten answers**, speed up decode (INT4, speculative decoding, smaller vocabulary), or stream the first tokens early to improve perceived latency.
+- For video or many tiles, the encoder becomes the dominant term.
+- Fit your own numbers with the microbenchmarks in section 3.
+
+## 3. How to measure and profile
+
+### 3.1 Metrics to collect
+- TTFT, TPOT (inter-token latency), E2E, and **per-stage times**.
+- **Percentiles (p50, p95, p99)**, not only the mean. Tail spikes come from DVFS, thermal throttling, GC, background load and memory pressure.
+- **Cold vs warm:** model load, NPU graph compilation or initialization, page faults on memory-mapped weights, and clock ramp-up make the first inference much slower.
+- **Sustained behaviour:** run for several minutes to see the throttled steady state (Q16).
+- **Energy** per inference (power rails or fuel gauge), **peak memory** (RSS/PSS, DMA buffers), and **accuracy** measured in the same run.
+
+### 3.2 Tools
+- **System tracing:** Perfetto and systrace (with custom trace markers around each stage), simpleperf, Android Studio profiler. These show CPU threads, scheduling gaps and memory.
+- **GPU/NPU vendor tools:** Qualcomm QNN profiling and AI Hub, Snapdragon Profiler, Arm Streamline, MediaTek NeuroPilot, Samsung's Exynos NPU tooling (check your SDK's profiler), Apple Instruments for Core ML/ANE.
+- **Framework profilers:** ExecuTorch ETDump/Inspector, TFLite `benchmark_model` with op profiling, ONNX Runtime profiling, `llama-bench` (llama.cpp, reports prompt-processing and token-generation rates), MLC-LLM benchmarks.
+- **Roofline check:** compare achieved TOPS and GB/s (from hardware counters) against the peak to see which stage is far from its limit.
+
+### 3.3 Methodology (this is where most mistakes happen)
+1. **Instrument stage boundaries** with monotonic timestamps or trace events.
+2. **Synchronize with the accelerator.** NPU and GPU calls are often asynchronous. If you don't wait on the fence, you measure enqueue time, not execution time.
+3. **Warm up** before timing, and measure cold start separately.
+4. **Control the environment for microbenchmarks:** fixed clocks where possible, a known starting temperature, background apps controlled. Then repeat under **default DVFS and realistic load** (camera and ISP running) for the realistic numbers.
+5. **Run at least 30 to 100 iterations** and report percentiles.
+6. **Microbenchmark each stage in isolation:**
+   - Encoder alone, with random input, at each supported resolution and tile count.
+   - Prefill sweep over N = 64 to 2048 tokens (and with the chunk size you ship).
+   - Decode sweep over context lengths 0 to 4k, to see the KV-read effect.
+7. **Fit simple latency models** to feed the token-budget solver from Q2:
+   - `T_prefill(N) ≈ a + b·N (+ c·N²)`
+   - `T_decode(ctx) ≈ w + k·ctx`
+8. **Trace end to end and look for gaps:** idle NPU time between stages (scheduling or copy overhead), **CPU fallbacks** from unsupported ops (one fallback inside the ViT can ruin the whole encoder), host-to-device copies, layout transposes, and contention with the camera pipeline.
+9. **Use real prompts and images.** E2E depends on the output-length distribution, so benchmark with a representative workload.
+
+## 4. Optimizations by stage
+
+| Stage | Levers |
+|---|---|
+| **Image decode** | Hardware decoder. **Decode-time downscaling** (JPEG scaled decode at 1/2, 1/4, 1/8 is much cheaper than full decode then resize). Take a lower-resolution YUV stream from the camera/ISP instead of the full still. Zero-copy buffers (dmabuf / AHardwareBuffer). Overlap decode with model warm-up |
+| **Preprocess** | Fuse resize, normalize and layout conversion into one pass. Use GPU, ISP scaler or NEON. Feed uint8 into the graph with the normalization folded into the first layer's weights. Pre-allocate buffers and avoid Java/Python copies. Tile on the GPU |
+| **Vision encoder** | Fewer or adaptive tiles and lower resolution where the task allows (Q2). W8A8 on NPU kernels (Q11). Fused attention, windowed attention for large N. Replace unsupported ops to avoid CPU fallback. Static shape buckets. Token merging inside the ViT. A smaller or distilled encoder (Q10). **Cache encoder outputs** across turns, and skip near-identical video frames. **Pipeline** the encoder with prefill (see below) |
+| **Projector** | Fuse into the tail of the encoder graph or the head of the LLM graph. Avoid CPU round-trips, extra layout transposes and dtype flips |
+| **Prefill** | Fewer visual tokens (pixel-shuffle, pruning, Q2). **Chunk sizes matched to the compute-bound threshold** (a few hundred tokens). **Prefix caching** of the system prompt's KV. W8A8 so the integer MACs are used. Fused attention. KV reuse across turns. Overlap with the encoder |
+| **Decode** | INT4 weights (fewer bytes per token). GQA/MQA and KV quantization (fewer KV bytes). **Smaller vocabulary or cheaper LM head** (Q1 deep dive). **Speculative decoding**, which raises arithmetic intensity by verifying several tokens per weight read (Q15). One fused decode graph per token to avoid per-op dispatch. **On-device argmax/sampling** to avoid CPU-NPU synchronization per token. Static in-place KV buffers. Weights resident and pre-faulted (no page faults) |
+| **Output control** | Short, structured answers, constrained decoding, early stopping, **streaming the first tokens to the UI** for perceived latency |
+| **System** | Precompiled NPU context binaries (no on-device JIT). Keep the model warm and resident (and plan for the OS low-memory killer). Lazy-load only what the feature needs. Performance hints or sustained-performance modes to avoid slow DVFS ramp-up. Control memory-bandwidth contention from the camera and display |
+
+### Pipelining ideas
+- **Encoder → prefill pipelining:** with a causal LLM, you can start prefilling visual tokens from tile 1 while the encoder still processes tile 2. This hides part of the encoder time.
+- **Parallel work on other units:** tokenization, text embedding and position-ID computation on the CPU while the NPU runs the encoder.
+- **Heterogeneous split:** some stacks run prefill on the NPU and decode on the GPU or CPU. Whether that wins depends on your runtime and memory bandwidth, so measure it.
+
+## 5. Cold start and load time
+- Loading a ~1.1 GB model from flash is on the order of a few hundred milliseconds to seconds. Add NPU context creation, and a possible compile step if there is no precompiled binary.
+- **Mitigations:** precompiled context binaries, memory-mapped weights, loading the LLM and the vision tower lazily or in parallel, warm-up at app launch, and a plan for the OS killing background processes (then you pay the cold start again).
+- Cold-start cost is a separate SLO from TTFT. Measure and report it separately.
+
+## 6. Common pitfalls
+- **Measuring async enqueue time** instead of execution time.
+- **Mean-only reporting** that hides p99.
+- **Marketing TOPS vs achieved TOPS.** INT4 doesn't give 2x over INT8 if the dequantization runs on a slower vector unit.
+- **Silent CPU fallbacks** from a single unsupported op.
+- **Non-zero-copy transfers and layout conversions** (NCHW/NHWC).
+- **Padding waste** from static-shape buckets.
+- **Latency variance from tile count.** Cap the number of tiles to bound tail latency.
+- **Dev-board vs production-device differences** (thermal policy, memory configuration).
+- **Benchmarking only the model,** and forgetting decode, preprocess and sampling.
+
+## 7. Using the breakdown to set budgets
+Start from the SLO (say E2E ≤ 1 s) and allocate: capture + preprocess about 50 ms, encoder about 150 ms, prefill about 150 ms, first token about 40 ms, which leaves about 600 ms of decode. At 40 ms per token that is about 15 tokens. If answers need to be longer, you must raise decode speed, cut the earlier stages, or stream and accept a longer total. This is how the numbers connect to the token budget in Q2 and the case study in Q25.
+
+## 8. Strong interview answer
+> "I split the pipeline into image decode, preprocess, vision encoder, projector, prefill and decode, and I report TTFT, TPOT and E2E with percentiles, separately for cold and warm runs. By a roofline argument, with a ridge point of about 800 ops per byte on a flagship SoC, prefill and the encoder have hundreds of tokens in flight, so they are compute-bound, while decode with one token per step is around 200x below the ridge and is memory-bandwidth-bound. Decode speed is roughly bandwidth divided by bytes read per token, so INT4 weights, GQA and KV quantization help directly. Preprocessing and unfused elementwise ops are memory-bound and often forgotten, and the projector's real cost is graph breaks and copies, not FLOPs. For a short answer, TTFT is dominated by the encoder and prefill. For anything longer than about 10 to 20 tokens, decode dominates, so answer-length control is a major lever. To measure, I'd instrument stage boundaries with trace markers, synchronize with the accelerator so I don't time enqueue, warm up, control or at least record clocks and temperature, take 30 to 100 runs for percentiles, microbenchmark each stage with sweeps over tiles, prompt length and context length, fit linear latency models, and look at Perfetto traces for NPU idle gaps and CPU fallbacks. Optimizations map by stage: scaled decode and zero-copy for image decode, fused preprocessing, fewer tiles and W8A8 with fused attention for the encoder, chunked prefill with prefix caching, INT4, fused decode graphs, on-device sampling and speculative decoding for decode, plus precompiled NPU binaries and warm models for the system. I'd budget stages from the SLO and verify everything on the real device under thermal throttling."
+
+## 9. Follow-up questions to prepare for
+1. Why is decode memory-bandwidth-bound while prefill is compute-bound? Show it with arithmetic intensity.
+2. What chunk size would you pick for prefill on an NPU with a ridge point of about 800 ops/byte, and what limits it from above?
+3. How can the projector take a significant share of time even though it has few FLOPs?
+4. How do you make sure you are not measuring asynchronous enqueue instead of execution time?
+5. How would you detect and eliminate a CPU fallback inside the vision encoder?
+6. Why can per-token CPU sampling hurt decode speed, and how do you fix it?
+7. How would you pipeline the vision encoder with LLM prefill, and what does causality allow?
+8. How do you separate cold-start latency from steady-state latency in your reporting?
+
+---
+
+# Q13: Deployment stack choices
+
+**Question:** Compare ExecuTorch, ONNX Runtime (with QNN or NNAPI EPs), TFLite/LiteRT, llama.cpp/GGUF, MLC-LLM, TensorRT-LLM and the vendor SDKs (Qualcomm QNN/SNPE, Samsung Exynos NPU / ONE toolchain). How would you export a VLM (dynamic shapes, multiple graphs for the encoder and decoder, KV-cache as I/O)? What breaks during export (unsupported ops, dynamic control flow, rotary embeddings), and how do you work around it?
+
+This space changes fast. The descriptions below are from memory and represent the stacks roughly as of 2025. Anything I mark "(verify)" should be checked against the current docs before you rely on it in an interview.
+
+## 0. How to think about the choice
+A deployment stack answers four questions:
+1. **Which hardware does it reach** (CPU, GPU, NPU, which vendor)?
+2. **How does the model get in** (export to a graph, or run eagerly)?
+3. **Does it handle the LLM loop** (KV-cache, sampling, chunked prefill) and multimodal inputs?
+4. **How much control and maintenance** does it need (static shapes, quantization recipe, operator coverage)?
+
+NPUs give the best latency and energy, but they need static shapes, constrained operators and vendor toolchains. CPUs and GPUs are flexible but slower and use more power. Production systems usually need **both**: an NPU fast path and a fallback.
+
+## 1. The stacks
+
+### 1.1 ExecuTorch (PyTorch Edge)
+- **Flow:** `torch.export` → edge dialect → lower to **delegates** → a `.pte` file → a small C++ runtime.
+- **Backends:** XNNPACK (CPU), Qualcomm QNN, MediaTek, Core ML / MPS (Apple), Vulkan (GPU), Arm Ethos-U, and a Samsung Exynos delegate (verify current status).
+- **LLM and VLM:** has Llama-family examples with KV-cache, 4-bit group-wise quantization (torchao), QAT/SpinQuant recipes, and a LLaVA example.
+- **Pros:** PyTorch-native end to end, ahead-of-time memory planning, a small runtime, and custom-op and partitioner hooks. A good fit if you want one export path to several backends.
+- **Cons:** newer, delegate coverage varies, and `torch.export` is strict about dynamic control flow and data-dependent shapes.
+
+### 1.2 ONNX Runtime (ORT)
+- **Flow:** export to ONNX (`torch.onnx.export`), then run with an execution provider (EP).
+- **EPs:** QNN EP (Qualcomm HTP), NNAPI (Android, being phased out in favor of other paths, verify), XNNPACK, Core ML, DirectML, CUDA/TensorRT, OpenVINO.
+- **LLM:** the ORT GenAI library handles the generation loop and KV-cache, with multimodal support for some models (e.g. Phi vision models). `MatMulNBits` provides 4-bit weights, and Olive automates optimization.
+- **Pros:** portable, mature tooling, strong on Windows and cross-platform.
+- **Cons:** the QNN EP wants **static shapes and QDQ-quantized models**. Unsupported ops cause graph partitions and CPU fallbacks. The 2 GB protobuf limit needs external-data files.
+
+### 1.3 TFLite / LiteRT
+- **Flow:** convert to TFLite (for PyTorch, `ai_edge_torch` via `torch.export`/StableHLO). Google renamed TFLite to **LiteRT**.
+- **Delegates:** XNNPACK, GPU (OpenCL/OpenGL/Metal), vendor NPU delegates (Qualcomm, MediaTek, and historically Samsung's), NNAPI (deprecated).
+- **LLM and VLM:** `ai_edge_torch.generative` builds LLMs with the KV-cache as inputs/outputs and separate prefill and decode **signatures**. MediaPipe LLM Inference API / LiteRT-LM serve Gemma-family models, including multimodal ones (verify).
+- **Pros:** huge Android footprint, a good GPU delegate, Google-maintained.
+- **Cons:** conversion pain for new architectures, op coverage gaps, and the FlatBuffers 2 GB limit for large models.
+
+### 1.4 llama.cpp / GGUF
+- **Flow:** no export. A C/C++ runtime executes the model eagerly from a **GGUF** file (k-quants such as Q4_K_M, i-quants).
+- **Backends:** CPU (NEON, i8mm, SVE), Metal, Vulkan, OpenCL (with an Adreno-optimized path), CUDA. NPU support is limited and experimental, including a Hexagon backend (verify).
+- **Multimodal:** vision encoders run through the `mtmd`/`mmproj` path, with many VLMs supported (Qwen-VL family, Gemma, SmolVLM, InternVL and others).
+- **Pros:** the fastest way to run a new model, natively dynamic shapes, mmap loading, speculative decoding, grammar-constrained sampling, prefix caching, MIT license.
+- **Cons:** mostly CPU/GPU, so higher power than an NPU. The vision encoder is less optimized. Not a static-graph path.
+
+### 1.5 MLC-LLM (Apache TVM)
+- **Flow:** compile the model with TVM into model-specific kernels (auto-tuned) for Vulkan, OpenCL, Metal, CUDA and WebGPU. Packages Android and iOS apps.
+- **Pros:** strong GPU performance on phones (Adreno, Mali), cross-platform, paged KV-cache, quantization formats like `q4f16`.
+- **Cons:** a complex compile pipeline, a smaller ecosystem, and **no mainstream NPU path**.
+
+### 1.6 TensorRT-LLM
+- **Flow:** build TensorRT engines (a visual engine plus an LLM engine for VLMs), with in-flight batching, paged KV, FP8/INT4 (AWQ, GPTQ) and speculative decoding.
+- **Targets:** **NVIDIA GPUs only**, including Jetson-class edge modules and the cloud.
+- **Fit:** robots or devices built on Jetson, and the **server-side tier** for cloud fallback (Q17).
+- **Cons:** vendor lock-in, engines are rebuilt per GPU and TensorRT version, and it is not for phone SoCs.
+
+### 1.7 Vendor SDKs
+
+**Qualcomm (QNN / Genie / AI Hub; SNPE is the legacy predecessor):**
+- QNN (AI Engine Direct) targets the **HTP** (Hexagon NPU), GPU and CPU. You convert models, quantize (PTQ, plus **AIMET** for advanced PTQ and QAT), and compile offline to a **context binary**.
+- Qualcomm AI Hub compiles and profiles on real devices. **Genie** is an LLM runtime on top of QNN that handles the KV-cache and token loop.
+- Constraints: **static shapes**, fixed-point-oriented numerics (INT8 or INT16 activations, INT4/INT8 weights, i.e. "W4A16" in their terminology), limits on graph and context-binary size (large models are split into several parts), and **weight sharing** between graphs (prefill and decode variants) to avoid duplicating weights.
+
+**Samsung (Exynos NPU SDK and the ONE toolchain):**
+- **Exynos AI Studio / ENN SDK** for the Exynos NPU: convert (TFLite- or ONNX-based flows), compile for the NPU and run through the ENN runtime on Android (verify current names and versions).
+- **ONE (On-device Neural Engine)** is Samsung Research's open-source compiler and runtime toolchain (the Circle IR, `one-cc`, quantization tools, and the `onert` runtime). It targets on-device and embedded products and appears aimed at devices such as TVs and appliances (verify scope).
+- **Why this matters for a Samsung role:** Galaxy devices ship with **both Snapdragon and Exynos** variants depending on region and model, and TVs and appliances use other SoCs. A production team needs a portable approach (section 5).
+
+**Others:** MediaTek NeuroPilot, Apple Core ML (ANE), and Google's AICore / Gemini Nano APIs on supported phones.
+
+### Summary table
+
+| Stack | Entry point | Hardware | LLM/VLM loop built in | Dynamic shapes | Strength | Weakness |
+|---|---|---|---|---|---|---|
+| ExecuTorch | `torch.export` → `.pte` | CPU, GPU, several NPUs via delegates | Examples + runner | Limited, AOT planned | One PyTorch path, small runtime | Newer, export strictness |
+| ONNX Runtime | ONNX | CPU, GPU, QNN EP, others | ORT GenAI | Yes on CPU, static on QNN | Portable, mature | Partitioning, QDQ and static shapes for NPU |
+| LiteRT/TFLite | TFLite | CPU, GPU, vendor NPUs | MediaPipe / LiteRT-LM | Limited | Android reach | Conversion pain |
+| llama.cpp | GGUF | CPU, GPU (Metal/Vulkan/OpenCL/CUDA) | Yes | **Yes** | Fast bring-up, broad model support | Mostly no NPU, higher power |
+| MLC-LLM | TVM compile | GPU (Vulkan/OpenCL/Metal/...) | Yes | Yes (compiled symbolic) | Good mobile GPU speed | Complexity, no NPU |
+| TensorRT-LLM | TRT engines | NVIDIA only | Yes | Engine profiles | Top NVIDIA performance | Lock-in |
+| Qualcomm QNN / Genie | Convert + compile | Hexagon NPU, GPU | Genie (LLM) | **Static** | Best Snapdragon NPU efficiency | Vendor-specific, static |
+| Samsung ENN / ONE | Convert + compile | Exynos NPU, embedded targets | Varies (verify) | Mostly static | Samsung silicon and devices | Vendor-specific, smaller community |
+
+## 2. Choosing a stack (decision framework)
+- **Phone, best latency and energy:** vendor NPU path (QNN on Snapdragon, ENN on Exynos), possibly through ExecuTorch delegates or ONNX/TFLite as the interchange.
+- **Fast prototyping and wide model coverage:** llama.cpp (GGUF), or PyTorch eager first.
+- **Phone GPU fallback:** llama.cpp (OpenCL/Vulkan) or MLC-LLM.
+- **Jetson robots and the cloud tier:** TensorRT-LLM (and vLLM for general serving).
+- **TV and appliance:** check the SoC. Often CPU or a small NPU, with the ONE/onert toolchain as an option.
+- **Other criteria:** team skills, time to market, license, update path (OTA of models and adapters), and how many vendors you must support.
+
+**A realistic staged strategy:**
+1. Prototype and validate accuracy in PyTorch eager and llama.cpp.
+2. Build the production NPU path per vendor (or via a shared export).
+3. Keep a CPU/GPU fallback for devices without a usable NPU.
+4. Keep a cloud tier (TensorRT-LLM / vLLM) for hybrid routing (Q17).
+
+## 3. How to export a VLM
+
+### 3.1 Split into several graphs
+A VLM is not one graph. A typical deployment uses:
+
+| Graph | Inputs | Outputs | Notes |
+|---|---|---|---|
+| **Vision encoder (+ projector)** | `pixel_values [tiles, 3, H, W]` (fixed bucket) | visual embeddings `[tiles × tokens, D_llm]` | The projector can be fused into this graph |
+| **Token embedding** | token IDs | embeddings | Often a CPU gather on a memory-mapped table, saving NPU memory |
+| **LLM prefill** (one or several chunk sizes) | `inputs_embeds [1, chunk, D]`, position data (or cos/sin), attention mask, KV-cache in | KV-cache out, logits for the **last** position only | Skipping the LM head on other positions saves compute |
+| **LLM decode** | one token's embedding, position data, KV-cache | logits `[1, V]`, updated KV | Sequence length 1 |
+
+- **Merging visual and text embeddings happens on the host** (CPU), by writing the visual embeddings into `inputs_embeds` at the image-placeholder positions. This avoids dynamic scatter inside the graph.
+- The generation loop (sampling, stopping, streaming) lives in host code.
+- **Share weights across the prefill and decode graphs** (ExecuTorch multi-method programs and QNN weight sharing, verify specifics), otherwise you store the LLM weights several times.
+
+### 3.2 KV-cache as I/O
+Options:
+1. **Functional I/O:** pass the cache in and out each step. Simple, but copying a large cache every step is expensive.
+2. **Mutable state or in-place update:** the graph updates a buffer in place (ExecuTorch mutable buffers, or zero-copy shared buffers in vendor runtimes). Needs delegate support.
+3. **Static fixed-capacity cache:** a buffer `[layers, 2, kv_heads, max_ctx, head_dim]` plus a write index and a mask for unused positions. No dynamic shapes, but attention then costs `max_ctx` every step, so compile **several context buckets** (e.g. 512, 1,024, 2,048, 4,096) and switch between them.
+
+Details that matter:
+- Writing into the cache at an offset uses `dynamic_update_slice`/`index_copy`/`scatter`, which may be unsupported on an NPU. Workarounds are a concat-and-slice scheme, a one-hot formulation, or fixed chunk positions with masking.
+- NPU-friendly layouts often store K transposed (`[head_dim, seq]`).
+- Quantized KV needs static scales per layer and head.
+- For long-running sessions, use a ring buffer or sliding window.
+
+### 3.3 Dynamic shapes: design them out
+- **Static by design:** fixed tile size and tile-count buckets for the encoder, fixed prefill chunk sizes, decode at sequence length 1, and a maximum context. The host picks the right graph at runtime.
+- Use truly dynamic shapes only where the backend supports them (CPU or GPU paths, ORT CPU). In `torch.export`, bound them with `Dim(min, max)`.
+- **Variable number of visual tokens:** pad to a bucket and mask (padded tokens still cost compute), or export one graph per bucket.
+- **Native-resolution encoders** (Qwen2-VL style): export several resolution buckets, and replace variable-length attention (`cu_seqlens` / flash-attn varlen) with a block-diagonal or windowed mask per bucket.
+- Precompute position tables (2D RoPE, interpolated position embeddings) per bucket (Q3).
+
+## 4. What breaks during export, and the workarounds
+
+| Problem | Symptom | Workaround |
+|---|---|---|
+| **Unsupported ops** (gather/scatter, `topk`, `cumsum`, `einsum`, bicubic `interpolate`, `unfold`, `pixel_shuffle`, `grid_sample`, `erf`-based GELU, fused SDPA) | Graph partitions, CPU fallbacks, compile errors | Rewrite using supported primitives (matmul, add, softmax, reshape, transpose, concat, slice). Precompute things offline (interpolated position embeddings). Decompose SDPA into matmul + softmax. Move unsupported ops to the host. Add custom ops or delegate kernels. Check the op-coverage report |
+| **Dynamic control flow and data-dependent shapes** (`if tensor`, `.item()`, `nonzero`, `masked_select`, loops over values) | `torch.export` fails, or `jit.trace` silently bakes in one branch | Refactor to static code, unroll loops with constant bounds, use `torch.cond` where supported, and move decisions (tile selection, stopping) to the host |
+| **Rotary embeddings** | Garbage output, NaNs, or slow graphs | See below |
+| **Attention masks** | NaNs, wrong attention | Precompute or pass masks as inputs. Use a large finite negative instead of `-inf` (FP16/INT can't hold -1e9). Avoid fully masked rows in softmax (NaN) |
+| **Embedding merge** (`masked_scatter`, `index_put` at image-token positions) | Dynamic-shape or unsupported op errors | Do it on the host |
+| **Large models** | Protobuf or FlatBuffers 2 GB limits, export OOM, duplicated tied weights | External-data files, splitting the model into parts (QNN context binaries are also split), de-duplicating tied embedding/LM-head weights |
+| **Numerical issues** | FP16 overflow, RMSNorm/LayerNorm instability | Scale q before the matmul, compute norms' sum of squares in FP32, double-check eps, and keep the quantization recipe in mind (Q11) |
+| **Custom model code** (`trust_remote_code`, flash-attn varlen, `einops`) | Export fails | Replace it with an export-friendly reference implementation |
+| **Preprocessing parity** | Accuracy drops on device only | Match the reference image processor exactly: interpolation and antialiasing, mean/std, RGB vs BGR, EXIF orientation, tiling rules, chat template |
+| **Memory lifecycle** | OOM from several resident graphs | Memory planning, time-multiplexing the encoder and LLM (load, run, unload), and sharing weights |
+
+### Rotary embeddings in more detail
+1. **Precompute cos/sin tables in FP32** (host or constants), and feed the slice for the current positions as graph inputs. This avoids `arange`/`pow`/gather inside the graph and avoids FP16 precision loss at large positions.
+2. **Avoid complex-number implementations** (`view_as_complex`, `polar`). Use the real-valued rotate-half form.
+3. **Match the weight layout:** the HF and original Llama layouts differ (the q/k projection weights are permuted in conversions). Mixing a layout and a rotate-half convention gives silently wrong output.
+4. **Scaling variants** (YaRN, NTK, llama3 scaling): compute the inverse frequencies offline.
+5. **M-RoPE** (Qwen2-VL): build the three-section position IDs on the host, produce the final cos/sin, and track `rope_delta` for decode (Q3).
+6. **2D RoPE in the ViT:** precompute row and column tables per resolution bucket.
+7. **Don't quantize the tables.**
+
+### Verification process
+- **Layer-wise comparison** against PyTorch eager (e.g. cosine similarity above 0.99 per layer in FP16).
+- **End-to-end greedy decode match** for the first N tokens on a test set.
+- **Op-coverage and partition report** after every change, and a performance baseline.
+- A common practice is an **export-friendly rewritten model definition** kept in sync with the reference through tests (as in Meta's Llama export code or `ai_edge_torch.generative`). Some NPU toolchains also prefer rewriting linear layers as 1×1 convolutions with specific layouts (verify for your target).
+
+## 5. Multi-vendor strategy (relevant for Samsung)
+- Galaxy devices use both Snapdragon and Exynos, TVs and appliances use other SoCs, and robots may use yet another platform.
+- **Single source of truth:** one export-friendly model definition and one evaluation harness.
+- **Per-target lowering recipes:** each vendor gets its own conversion, quantization (Q11) and shape-bucket configuration, and a capability matrix (ops, precisions, max graph size).
+- **A fallback ladder:** NPU → GPU → CPU → cloud.
+- **Shared CI:** golden vectors, accuracy, hallucination (Q9) and latency gates run per target on real devices.
+- **OTA updates:** versioned models, adapters and compiled binaries per device class.
+
+## 6. Strong interview answer
+> "I choose the stack by hardware reach, how the model gets in, and whether it handles the LLM loop. For phone NPUs the best latency and energy come from the vendor toolchains, QNN with Genie on Snapdragon and the Exynos NPU SDK on Exynos, which need static shapes, fixed-point-friendly quantization and offline compilation. ExecuTorch and ONNX Runtime give a shared export path with vendor delegates or EPs. LiteRT is strong on Android GPU and Google's LLM APIs. llama.cpp is the fastest bring-up with native dynamic shapes, but it mostly runs on CPU or GPU. MLC-LLM is good on mobile GPUs, and TensorRT-LLM covers NVIDIA, i.e. Jetson robots and the cloud fallback. I'd prototype in eager PyTorch or llama.cpp, build the NPU path per vendor, and keep a GPU or CPU fallback. For export, I'd split the VLM into an encoder plus projector graph, a token-embedding lookup on the host, prefill graphs at fixed chunk sizes, and a decode graph, sharing weights. The embedding merge, sampling and the generation loop run on the host. KV-cache is a static, fixed-capacity buffer passed as I/O or updated in place, with a few context buckets. I'd design out dynamic shapes with buckets and masks. The things that break are unsupported ops, which I rewrite to primitives or move to the host, data-dependent control flow, which I make static or move to the host, and rotary embeddings, where I precompute FP32 cos/sin tables, avoid complex numbers, match the weight layout, and handle M-RoPE and `rope_delta` on the host. I'd validate with layer-wise comparisons and end-to-end greedy-token matches, check preprocessing parity, and gate per target on real devices, since Samsung ships both Snapdragon and Exynos."
+
+## 7. Follow-up questions to prepare for
+1. Why do NPU toolchains require static shapes, and how do buckets and masks work around that?
+2. What are the trade-offs between functional KV-cache I/O, in-place mutable buffers, and a static fixed-capacity cache?
+3. Why compute the LM head only for the last position in prefill?
+4. How would you handle a vision encoder with variable-length attention (`cu_seqlens`) on an NPU?
+5. What silent bugs can come from mixing RoPE weight layouts and rotate-half conventions?
+6. When would you choose ExecuTorch over ONNX Runtime, or the reverse, for a multi-vendor product?
+7. How does weight sharing across prefill and decode graphs work, and what does it save?
+8. How would you structure CI so that Snapdragon, Exynos and CPU fallback paths all stay correct after each model change?
+
+---
+
+# Q14: Memory budgeting on a phone
+
+**Question:** The device has 12 GB RAM shared with the OS and other apps, and your VLM gets about 2–3 GB. Compute the memory for weights (INT4), KV-cache (layers × heads × dim × seq × bytes), vision activations and the image buffer. How would you use mmap/lazy loading, KV-cache eviction, sliding-window or sink attention, and GQA/MQA to fit? What are the OOM and thermal risks, and how do you handle them gracefully?
+
+Model dimensions are those of public models (Qwen2.5-1.5B and 3B, Llama-3.2-1B, Llama-3.1-8B) as I remember them, and OS behavior is Android-centric. Treat all numbers as illustrative and measure on your own device.
+
+## 0. "12 GB" is not 12 GB for you
+- The OS, system services, GPU/ISP/modem carve-outs and other apps use a big share. Your app might realistically see **about 3 to 5 GB** before the system starts killing things, and a VLM feature gets a fraction of that.
+- **Android's low-memory killer (lmkd)** kills processes under memory pressure, based on PSI (pressure stall information) and each process's priority. A **kill is silent**: no exception, the process just disappears. Foreground apps are safer but not immune.
+- **Memory types behave differently:**
+  - **Anonymous memory** (malloc'd weights, KV-cache, activations): can't simply be dropped. Android compresses it to zram, but INT4 weights are essentially incompressible, so zram doesn't help.
+  - **File-backed mmap pages:** clean pages are reclaimable and re-readable from flash, so they are cheaper for the OS, but re-reading is slow (see section 3).
+  - **dma-buf / ION / NPU buffers:** allocated from shared system heaps, accounted separately, and often limited by the NPU driver (contiguous or pinned memory, virtual-address limits).
+- **Budget per RAM class** (a policy, not a fact): an 8 GB phone might get about 1.5 to 2 GB, a 12 GB phone about 2 to 3 GB, a 16 GB phone about 3 to 4 GB. Test on the **lowest RAM tier** you ship.
+
+## 1. The memory components, with formulas and numbers
+
+### 1.1 Weights
+`bytes = params × bits / 8`, plus quantization overhead. With group size 128 and FP16 scales (and zero-points) add about 0.125 to 0.25 bits per weight, so use about **4.25 to 4.5 bits** for INT4 g128.
+
+**Example: ~2B VLM** (Qwen2.5-1.5B-class LLM, SigLIP-B-class encoder, pixel-shuffle projector):
+
+| Component | Size |
+|---|---|
+| LLM non-embedding, 1.31B × 4.5 bits | 0.74 GB |
+| Embedding / LM head (tied), 233M × INT8 | 0.23 GB |
+| Vision encoder, ~93M × INT8 | 0.09 GB |
+| Projector, ~13M × FP16 | 0.03 GB |
+| **Total weights** | **≈ 1.1 GB** (vs about 3.8 GB in FP16) |
+
+**Weight-memory traps (double residency):**
+- Keeping **both** a file-backed mmap copy and a repacked copy in NPU memory (2x). Drop the file pages after upload (`madvise(MADV_DONTNEED)` / unmap), or ship weights in the device-ready layout.
+- **Separate prefill and decode graphs** that don't share weights (2 to 3x). Use weight sharing (Q13).
+- **Tied weights duplicated** by an exporter (+0.23 GB).
+- Temporary FP16 or FP32 staging buffers at load time. **Peak memory occurs at load**, not only at steady state.
+
+### 1.2 KV-cache
+`bytes/token = 2 (K,V) × layers × kv_heads × head_dim × bytes_per_element`.
+
+| Model | Layers × KV heads × head_dim | KV per token (FP16) | 4k context FP16 | 4k context INT8 |
+|---|---|---|---|---|
+| Qwen2.5-1.5B (GQA) | 28 × 2 × 128 | 28 KB | ~117 MB | ~59 MB |
+| Same model if it used MHA (12 KV heads) | 28 × 12 × 128 | 168 KB | ~705 MB | ~350 MB |
+| Llama-3.2-1B (GQA) | 16 × 8 × 64 | 32 KB | ~134 MB | ~67 MB |
+| Llama-3.1-8B (GQA) | 32 × 8 × 128 | 128 KB | ~537 MB | ~268 MB |
+
+**Key points:**
+- **GQA/MQA cuts KV by the ratio of query heads to KV heads** (6x in the example above). Pick a GQA backbone for edge.
+- On-device runtimes usually allocate a **static buffer at `max_ctx`**, not the used length. If the default is 32k, Qwen2.5-1.5B pays about 0.94 GB. **Set `max_ctx` to what the feature actually needs** (e.g. 2k to 4k).
+- Several context buckets should **share one buffer** sized for the largest bucket (Q13), not one buffer each.
+- **Visual tokens:** 5 tiles × 64 tokens + text is only a few hundred tokens, so the cost is small. **Video is where it grows:** 30 s at 8 fps × 64 tokens = 15,360 tokens ≈ 440 MB in FP16 for this model.
+
+### 1.3 Vision activations
+- With a static memory planner (ExecuTorch AOT planning, TFLite arena, ORT memory pattern, NPU graph memory), **peak = the largest set of simultaneously live tensors**, not the sum.
+- **Example, SigLIP-B/16 at 512 px** (N = 1,024 tokens, D = 768, 12 heads): the hidden state is about 1.5 MB, the MLP intermediate (3,072) about 6.3 MB, and **unfused attention scores 12 × 1,024² × 2 B ≈ 25 MB** per layer (reused across layers). Fused attention removes the 25 MB term.
+- Encoding tiles **one at a time** (batch 1) keeps the peak flat. Batching tiles multiplies it.
+- NPU graph "arenas" are allocated at graph initialization, and can be tens to hundreds of MB. Check them in the compiler's memory report.
+- The encoder output (e.g. 5 × 64 × 1,536 × 2 B ≈ 1 MB) is negligible.
+
+### 1.4 LLM activations and logits
+- Prefill with a 256-token chunk: hidden states about 0.8 MB, MLP intermediate (8,960) about 4.6 MB, and unfused attention scores 12 heads × 256 × 4,096 × 2 B ≈ 25 MB.
+- **Logits are the hidden trap:** `256 × 151,936 × 4 B ≈ 156 MB` if you compute the LM head for every position. Compute it **only for the last position** (about 0.6 MB), as in Q13.
+
+### 1.5 Image buffers
+- 12 MP RGBA bitmap: 4,000 × 3,000 × 4 B = **48 MB**. YUV420 from the camera is 18 MB.
+- Five 512×512 tiles as normalized FP32: 5 × 512 × 512 × 3 × 4 B ≈ **15.7 MB** (FP16 about 7.9 MB, uint8 about 3.9 MB).
+- The camera pipeline holds several frames in flight (a ring of buffers).
+- **Reduce:** decode-time downscaling (`inSampleSize` / scaled JPEG decode) so you never hold the full bitmap, reuse buffers, feed uint8 into the graph, zero-copy hardware buffers, and release the original promptly.
+
+### 1.6 Runtime and miscellaneous
+- Runtime and framework state (ExecuTorch is small, ONNX Runtime tens of MB, llama.cpp compute buffers can be hundreds of MB for large batch sizes), tokenizer vocabulary (about 10 to 20 MB), NPU driver and context memory, thread stacks, sampling buffers, UI and app overhead.
+- Add **10 to 20% margin** for allocator fragmentation and peaks.
+
+### Worked budget (illustrative)
+
+| Item | Size |
+|---|---|
+| Weights | 1.1 GB |
+| KV-cache (4k context, INT8) | 0.06 GB (FP16: 0.12 GB) |
+| Vision activations arena | 0.10 to 0.20 GB |
+| LLM activations arena | 0.05 to 0.10 GB (the encoder and LLM arenas can be **shared**, since they don't run at the same time) |
+| Image buffers | 0.05 to 0.10 GB |
+| Runtime, tokenizer, misc | 0.15 to 0.25 GB |
+| NPU context / driver | 0.10 to 0.30 GB |
+| 15% margin | ~0.25 GB |
+| **Total** | **≈ 1.9 to 2.4 GB**, fits a 2 to 3 GB budget |
+
+**Will a bigger model fit?** A 3B-class LLM (Qwen2.5-3B-like): non-embedding 2.77B × 4.5 bits ≈ 1.56 GB, embedding/LM head 311M × INT8 ≈ 0.31 GB, plus encoder and projector ≈ 0.12 GB → about 2.0 GB of weights, and **about 2.8 GB total**, which is tight against a 3 GB budget and risky.
+
+```python
+def kv_bytes_per_token(layers, kv_heads, head_dim, bytes_per=2):
+    return 2 * layers * kv_heads * head_dim * bytes_per
+
+def weights_gb(params_b, bits=4.5):
+    return params_b * 1e9 * bits / 8 / 1e9
+
+llm   = weights_gb(1.31)                    # ~0.74 GB
+embed = 233e6 * 1 / 1e9                     # ~0.23 GB (INT8)
+vit, proj = 0.09, 0.03
+kv    = 4096 * kv_bytes_per_token(28, 2, 128, 1) / 1e9   # INT8 KV, ~0.06 GB
+fixed = 0.55                                # activations + images + runtime + NPU ctx (assumed)
+total = (llm + embed + vit + proj + kv + fixed) * 1.15
+print(f"{total:.2f} GB")                    # ~2.1 GB
+```
+
+## 2. Techniques to fit, by component
+
+**Weights**
+- INT4 g128 with sensitive layers at INT8 (Q11), a de-duplicated tied embedding, weight sharing across graphs.
+- **Vocabulary pruning** shrinks both the embedding and the LM head (Q1 deep dive, section 5).
+- If the model is bigger than the budget: **flash offloading** ideas (windowed loading, as in Apple's "LLM in a flash", or PowerInfer-2-style neuron-level streaming) trade latency for memory. They are a last resort, not for a ≤2B model.
+
+**KV-cache**
+- GQA/MQA backbone, INT8 or INT4 KV (Q11), and `max_ctx` set to the product need.
+- **Sliding-window attention:** only the last W tokens are cached on local layers. Gemma 2/3 interleave local and global layers (Gemma 3 uses about 5 local layers per global one with a 1,024-token window), which cuts KV a lot.
+- **Attention sinks (StreamingLLM):** keep the first few "sink" tokens plus a recent window and evict the middle. It allows indefinite streaming but loses the middle content, which is acceptable for continuous video chat but not for "what did I see 2 minutes ago".
+  - Detail: with eviction, positions need care. Store keys **before RoPE** and apply rotation using positions within the cache, or keep original positions consistently.
+- **Heavy-hitter eviction (H2O, SnapKV, Scissorhands):** keep tokens that received the most attention, plus recent ones. Prompt-KV compression for long prompts.
+- **For visual tokens:** after the model has answered, drop or compress the image's KV. Because the visual **embeddings** are tiny (320 tokens × 1,536 × 2 B ≈ 1 MB, versus about 9 MB of KV), you can keep embeddings and **re-prefill** if the user asks a follow-up.
+- **Video:** a fixed token budget per frame and a rolling window of K frames, so memory is bounded by design (Q22).
+- **Paged KV (vLLM-style):** avoids fragmentation and helps multi-session serving. On a single-user phone, a static buffer is simpler.
+
+**Activations**
+- A static memory planner, **chunked prefill** (smaller chunks, smaller activations), tile-by-tile encoding, **fused attention** (no N² score matrix), in-place ops, lower-precision activations, **logits for the last position only**, and **one shared arena** for graphs that never run concurrently (the arena size is the max, not the sum).
+
+**Process level**
+- One runtime instance in one process, no duplicate model copies, native buffers instead of Java bitmap copies, large allocations through anonymous `mmap` so they return to the OS when freed, and a scalable allocator (jemalloc/scudo) to limit fragmentation.
+
+## 3. mmap and lazy loading, with the latency catch
+
+**What mmap gives you:**
+- Weights are mapped read-only from the file, and pages load on demand. Clean pages are **reclaimable**, so the OS can free them instead of killing you.
+- No staging copy at load time, and fast startup.
+
+**The catch for LLM decode:** decode reads **all** weights every token. If the working set doesn't stay in RAM, every token page-faults from flash. At about 1 GB per token and flash reads of a few GB/s (UFS 4-class), that is roughly 3 tokens/s or worse, a latency disaster. So:
+- **Hot weights** (LLM layers, LM head): keep resident. Pre-fault them at load (`MAP_POPULATE`, `madvise(MADV_WILLNEED)`, or touch pages), or copy into anonymous or device memory. `mlock` is restricted for apps (RLIMIT_MEMLOCK).
+- **Cold or rarely used data** (embedding rows for input lookup when untied, vision tower while idle, LoRA adapters, alternate-language resources): mmap and let them be paged.
+- Pre-fault also removes **first-token latency spikes** from cold page faults (Q12).
+
+**Lazy loading of components:**
+- Load the vision tower only when a camera feature is invoked, and unload it afterwards (**time-multiplexing**). The benefit is small for an INT8 90M encoder (about 0.09 GB), but meaningful for a 400M encoder (about 0.4 GB). Weigh it against the reload latency.
+
+## 4. OOM risks and graceful degradation
+
+### 4.1 Risks
+- **Silent kill by lmkd** under memory pressure. In-process allocation failures (`ENOMEM`, `std::bad_alloc`) are catchable, but a kernel or lmkd `SIGKILL` is not.
+- **Peak vs steady state:** load-time staging, the largest prefill chunk, and camera frames in flight can coincide. Budget for the **peak**.
+- **Fragmentation and slow leaks** during long sessions.
+- **Background state:** a backgrounded app is killed first. Reloading means paying the cold start again (Q12).
+- **Co-resident work:** the camera, ISP and other apps compete for memory and bandwidth.
+
+### 4.2 Signals to watch
+- Android: `ComponentCallbacks2.onTrimMemory` levels, `ActivityManager.getMemoryInfo()` (`availMem`, `lowMemory`), native heap size, PSS, and PSI where accessible (`/proc/pressure/memory`, restricted on recent versions). iOS: `os_proc_available_memory()` and memory warnings.
+
+### 4.3 Graceful-degradation ladder
+1. **Pre-flight check** when the feature starts: read available memory and choose a configuration tier.
+   - **Tier A (full):** up to 6 tiles, 4k context, INT8 KV.
+   - **Tier B (reduced):** 2 tiles, 2k context.
+   - **Tier C (minimal):** one tile, 1k context.
+   - **Fallback:** cloud, or a clear "feature unavailable" message.
+2. **On trim-memory callbacks:** free caches (encoder-output cache, prefix cache, bitmap pools), unload the vision tower, evict or shrink the KV-cache, and cancel low-priority work.
+3. **On backgrounding:** unload the model (or keep it only if policy allows).
+4. **On allocation failure:** catch it, retry at a lower tier, and never crash.
+5. **Persist conversation state** (text and compact summaries) so a kill leads to a fast restore.
+6. **Admission control:** one inference at a time, with a queue.
+7. **Consider a separate service process:** a kill or crash doesn't take down the UI app. Image transfer then needs shared memory or hardware buffers, since IPC copies are expensive.
+
+### 4.4 Testing
+- Test on the **lowest RAM tier** and under induced pressure (a memory-hog app).
+- **Soak tests:** thousands of inferences, tracking the PSS and native-heap **slope** to catch leaks and fragmentation.
+- Tools: `dumpsys meminfo <pid>` (native heap, graphics), `smaps`/`smaps_rollup`, Perfetto memory counters, `heapprofd` for native allocations, and dma-buf dumps for NPU and camera buffers.
+
+## 5. Thermal risks and memory–thermal coupling
+- Sustained NPU and memory traffic heats the SoC, and the OS throttles clocks, which can make latency **2x or worse** over minutes (full treatment in Q16).
+- DRAM traffic is a major energy cost, so **less memory traffic means less heat**. INT4 weights, KV quantization, GQA and fewer visual tokens all help.
+- **Respond to thermal state:** Android's `PowerManager.getCurrentThermalStatus()` and `OnThermalStatusChangedListener`, and `getThermalHeadroom()` forecasts. Reactions include fewer tiles or lower resolution, shorter outputs, a lower frame rate for continuous video, a duty cycle with pauses, deferring background work, and routing to the cloud.
+- Also handle battery saver and low-power modes.
+
+## 6. Strong interview answer
+> "I'd budget by component, for the peak, not the steady state. Weights are params × bits/8 plus group-scale overhead: for a ~2B VLM that's about 0.74 GB for the INT4 LLM, 0.23 GB for an INT8 tied embedding and LM head, and about 0.12 GB for encoder and projector, so about 1.1 GB. KV is 2 × layers × KV heads × head_dim × bytes per token, about 28 KB per token for a Qwen2.5-1.5B-style GQA model, so about 117 MB at 4k in FP16 and half that in INT8. It matters mainly for video and for non-GQA models, and runtimes allocate at max_ctx, so I'd set max_ctx to the feature's need. Vision activations come from a static planner. I'd encode tiles one at a time, fuse attention to avoid N² score matrices, share one arena between the encoder and the LLM, and compute logits for the last position only, since full-position logits are about 156 MB. Image buffers are controlled with decode-time downscaling and buffer reuse. That adds up to about 2 to 2.4 GB with a 15% margin. To fit, I'd choose a GQA backbone, INT4 and INT8 KV, sliding-window or sink attention plus heavy-hitter eviction for long sessions, vocabulary pruning, weight sharing across graphs, and avoid double residency of mmap and device copies. mmap saves memory and survives pressure, but decode reads all weights per token, so hot weights must be pre-faulted and resident, and only cold data is paged. For OOM, I'd handle the lmkd's silent kills with a pre-flight tier selection, trim-memory handlers that drop caches and unload the encoder, catchable allocation failures with fallback to a lower tier, persisted state, and soak tests on the lowest RAM tier. For thermals, I'd listen to thermal status and headroom and reduce tiles, output length and frame rate, or route to the cloud."
+
+## 7. Follow-up questions to prepare for
+1. Why do INT4 weights not benefit from zram, and what does that imply for memory pressure?
+2. Why can mmap make memory safer but latency worse for LLM decode?
+3. How does GQA reduce KV-cache size, and what is the quality trade-off?
+4. How do attention sinks work, and what breaks if you evict the first tokens?
+5. How do you handle RoPE positions when you evict tokens from the middle of the cache?
+6. Why is "double residency" a common bug, and how would you detect it?
+7. How would you decide the tiers for the graceful-degradation ladder?
+8. How would you detect a slow memory leak or fragmentation in a long-running assistant?
+
+---
+
+# Q15: Speculative decoding, batching and scheduling on-device
+
+**Question:** Does speculative decoding help on a memory-bound mobile decoder? When would it hurt (draft cost, NPU kernel support)? How do you do continuous batching, prefix caching for repeated system prompts or repeated images, and chunked prefill when the device also runs camera and ISP pipelines concurrently?
+
+Speedup numbers come from the simple cost model in section 1, with assumed acceptance rates and cost ratios. They are for reasoning, not benchmarks. Paper details (EAGLE, Medusa, vLLM, Sarathi and others) are from memory, so check them before quoting.
+
+## 0. Framing: what "batching" means on a phone
+Server inference is about throughput across many users. On a phone you usually have **one user and batch size 1**, so latency matters most. But batching ideas still apply in three places:
+1. **Several concurrent sessions or clients** (an assistant, live captions and another app sharing one on-device model service).
+2. **Several frames or tiles** processed together.
+3. **Speculative verification**, which is a small batch of candidate tokens checked in one pass.
+
+The unifying fact from Q12: **decode is memory-bandwidth-bound**, so extra tokens or streams in the same pass are nearly free until you reach the compute ridge (a few hundred tokens in flight). All three techniques below exploit that slack.
+
+## 1. Speculative decoding
+
+### 1.1 How it works
+1. A cheap **draft** proposes `k` tokens autoregressively.
+2. The **target** model verifies all `k` in **one forward pass** (`k+1` positions).
+3. Accept the longest correct prefix, and sample one extra token from the target. With rejection sampling, the output distribution is **identical to the target's** (lossless). For greedy decoding, accept while the target's argmax equals the draft token.
+
+### 1.2 Why it can help on a memory-bound decoder
+Verifying `k+1` tokens reads the weights **once**, the same as decoding one token. With INT4 weights the arithmetic intensity at `k+1` ≈ 5 to 9 tokens is still far below the ridge point of roughly 200 to 400 tokens (Q12). So the extra verification compute is almost free, and the speedup is limited by acceptance, not by hardware.
+
+### 1.3 Cost model
+- Per-token acceptance rate α, draft length k. Expected tokens per iteration: `E = (1 − α^(k+1)) / (1 − α)`.
+- Cost per iteration (in units of one target decode step): `k·c + v`, where `c = T_draft / T_target` and `v ≈ 1.05` (verify is slightly more than one step).
+- Speedup ≈ `E / (k·c + v)`.
+
+| α | k | c (draft cost ratio) | E | Cost | Speedup |
+|---|---|---|---|---|---|
+| 0.7 | 4 | 0.1 | 2.77 | 1.45 | **~1.9x** |
+| 0.7 | 4 | 0.3 | 2.77 | 2.25 | ~1.2x |
+| 0.5 | 4 | 0.1 | 1.94 | 1.45 | ~1.3x |
+| 0.5 | 4 | 0.3 | 1.94 | 2.25 | **~0.86x (slower)** |
+
+**The on-device catch:** the target is already small (1 to 2B), so a draft that is **10x cheaper** would have to be about 100M parameters. A 0.5B draft for a 1.5B target has `c ≈ 0.33`, which erases most of the benefit. Cheap drafting is the whole game on-device.
+
+### 1.4 Variants and how they fit the edge
+
+| Variant | Idea | Edge fit |
+|---|---|---|
+| **Draft model** (small LM, same tokenizer) | Separate small model | Needs a tiny draft (about 50 to 150M). Extra weights and its own KV |
+| **Medusa** | Extra heads on the target predict the next k tokens, verified with tree attention | Needs fine-tuning. Each head needs a vocabulary projection (hidden × vocab). With a 152k vocabulary, that is about 233M parameters **per head**, which is expensive (Q1 deep dive) |
+| **EAGLE / EAGLE-2** | A light autoregressive head on the target's **hidden features**, reusing the target's LM head. EAGLE-2 builds a dynamic draft tree | Small overhead (about one decoder layer), high acceptance. A natural fit for edge, and for VLMs, because the target's hidden states already contain the visual information |
+| **Prompt-lookup / n-gram** | Propose tokens that copy from the prompt or earlier text | **Free** (no model). Excellent for copy-heavy outputs: OCR text, JSON extraction, quoting UI text |
+| **Lookahead decoding** | Jacobi-style parallel guesses and an n-gram pool | No draft model, modest gains |
+| **Layer-skip / early-exit self-speculation** (e.g. LayerSkip) | Draft with the first layers of the target, verify with all | No extra weights, but needs training for good acceptance |
+| **MTP heads** | Multi-token-prediction heads used for speculation | Needs a model trained that way |
+
+### 1.5 Multimodal specifics
+- The draft must know the image to predict visually grounded tokens. Options:
+  - **Text-only draft:** simpler, lower acceptance on image-dependent tokens (reported to still give useful speedups on LLaVA-style models, verify).
+  - **Small VLM draft:** better acceptance, but has its own visual path.
+  - **EAGLE-style head on the target's features:** reuses the target's visual information and needs no separate image prefill. This is the cleanest option.
+- On-device VLM answers are often **short** (5 to 30 tokens), so fixed overheads (draft warm-up, extra graph launches) matter. Acceptance is high for **structured or copy-heavy** outputs (OCR, JSON, UI labels) and low for creative text.
+
+### 1.6 When it hurts (the checklist)
+1. **Low acceptance:** high-temperature sampling, creative tasks, or a draft that doesn't match the target after fine-tuning. If you LoRA-tune the target on your domain (Q7), you must also tune or distill the draft on the target's outputs (Q10), otherwise α drops.
+2. **A draft that is too expensive:** `c` above roughly 0.2 to 0.3 (the table above).
+3. **No small-M verify graph on the NPU.** If the only compiled prefill graph is 128 tokens, verification becomes a compute-bound 128-token pass, which can be slower than the decode steps it replaces. You need verify graphs with **M = 4 to 16** (padding up to 8 or 16 is nearly free because decode is memory-bound).
+4. **Missing kernel support:** tree attention masks, KV compaction for accepted branches, and per-iteration host logic. Static-graph NPUs may not support them.
+5. **Host-device sync overhead per iteration:** drafting k tokens in sequence, a verify launch, then host-side accept/reject using `(k+1) × V` logits (about 1.8 MB for k = 5, V = 152k, FP16). Each sync costs milliseconds.
+6. **Memory budget:** extra draft weights and KV (Q14). A 150M INT4 draft is about 0.08 GB, an EAGLE head about 2 to 3% of the model.
+7. **Short outputs,** where setup costs dominate.
+8. **Compute is not free anymore:** if another workload shares the NPU, or you use large trees (M in the tens to hundreds).
+9. **Numerical non-determinism:** the verification pass uses a different kernel shape (M = k+1 vs 1), so tiny numerical differences in FP16/INT4 can flip near-tied tokens. Outputs may not be bitwise identical to non-speculative decoding.
+
+### 1.7 Engineering details on a static-graph NPU
+- **KV rollback:** with a static buffer and a write index, rejected tokens are simply not committed (the index doesn't advance, and the mask hides them). **Tree** verification needs the accepted branch's KV copied to contiguous positions.
+- **Where to run the draft:** on the same NPU (sequential launches), or on the CPU/GPU. A CPU draft is slower (larger `c`) and competes for shared DRAM bandwidth with the NPU.
+- **Adaptive k:** adjust the draft length from a running acceptance estimate, or draft until the draft's confidence drops below a threshold (EAGLE-2-style dynamic trees).
+- **Per-task enable/disable:** turn it on for OCR and JSON outputs, off for creative chat.
+- **Energy:** wasted draft compute costs energy, but fewer weight reads per accepted token usually lowers energy per token. Measure joules per token, not just latency.
+- **Evaluate** acceptance length (tokens per verify step), TPOT, E2E, energy per accepted token, memory, and a lossless-equivalence check against non-speculative output (within numeric tolerance), on **product workloads**, not generic chat.
+
+## 2. Continuous batching and scheduling
+
+### 2.1 Server ideas (what they are)
+- **Iteration-level scheduling (Orca):** requests join and leave the batch at every decode step, instead of waiting for a whole batch to finish.
+- **Paged KV (vLLM PagedAttention):** KV stored in blocks, so no big contiguous buffers, little fragmentation, and easy sharing.
+- **Chunked prefill (Sarathi-style, "stall-free"):** split long prefills into chunks and interleave them with decode steps, so decodes aren't blocked.
+- **Prefix caching:** hash blocks (vLLM) or a radix tree (SGLang RadixAttention) to reuse shared prefixes.
+
+### 2.2 What carries over on-device
+- Decode is memory-bound, so **B concurrent streams cost about the same per step as one** (until the ridge). Throughput scales almost for free if there is memory for B KV-caches. At about 28 KB per token (Qwen2.5-1.5B-class), four 2k-token sessions are about 230 MB, which is affordable.
+- NPU graphs are **static**, so use **slot-based batching**:
+  - Compile the decode graph for a fixed number of slots S (e.g. 1, 2, 4), each with its own KV region.
+  - Each step runs all S slots, with per-slot positions and an attention mask `[S, 1, ctx]`. Inactive slots are masked, and because decode is memory-bound, running 4 slots with 1 active costs about the same as running 1.
+  - Admit a request by assigning a free slot and running its (chunked) prefill into that slot. Free the slot when it finishes.
+- **When it matters:** a system-wide model service shared by several apps, parallel sampling (n-best), and multi-agent flows. For a single-user camera assistant, scheduling is mostly about priorities, not batching.
+
+### 2.3 Scheduling policy
+- **Priorities:** interactive foreground request > background summarization or indexing.
+- **Preemption:** pause a low-priority decode to run a high-priority prefill, and either keep the paused KV (if memory allows) or recompute it later.
+- **Deadline-aware** policies (e.g. earliest-deadline-first) with explicit TTFT and TPOT targets.
+- **Per-iteration token budget:** cap the tokens processed per iteration so decode streams stay within the TPOT target.
+- **Admission control by memory** (slots, KV budget), tied to Q14's tiers.
+
+### 2.4 Chunked prefill, with camera and ISP running at the same time
+- **Why chunk:** a long prefill (say 300 to 2,000 tokens) would stall every decoding stream. A chunk of C tokens bounds the stall to about `T_prefill(C)`.
+- **Chunk size trade-off:** small C means shorter stalls but less efficient (each chunk re-reads the weights and attends over the growing KV, and below the ridge of about 200 to 400 tokens the NPU is memory-bound). Large C means longer stalls. Choose C near the ridge (e.g. 128 to 256) and match a compiled graph size.
+- **Static-graph details:** the last chunk is padded and masked, the KV write offset advances per chunk, and prefix reuse starts prefill at a nonzero offset.
+
+**Co-running with the camera and ISP:**
+- The ISP and camera pipeline have **hard real-time deadlines** (a 30 fps preview needs a frame every 33 ms). They share **DRAM bandwidth, the power budget and the thermal budget** with the NPU.
+- If the NPU hogs bandwidth or a long graph blocks, the camera can **drop frames or jank**.
+- Design principles:
+  1. **Treat camera/ISP as hard real-time and the VLM as best effort.**
+  2. **Make work preemptible by splitting graphs.** Many NPUs can't preempt a running graph, so a 150 ms encoder graph blocks everything. Split into sub-graphs (per tile, per group of layers) to create yield points of about 10 to 20 ms.
+  3. **Use scheduling hints:** NPU graph priority settings where the SDK has them, thread priorities and cgroups, and Android's performance-hint APIs. DRAM QoS for the ISP is mostly system-level and not controllable by an app (verify).
+  4. **Schedule between frames,** or during idle gaps, and reduce VLM activity during capture bursts.
+  5. **Sample frames sparsely** for live use (e.g. 1 to 2 fps or event-triggered), and use a "latest frame wins" queue so stale frames are dropped instead of queued.
+  6. **Mind shared power and thermals:** NPU activity can lower CPU/ISP clocks under a shared budget (Q16).
+  7. **Measure the interference:** in Perfetto, watch camera frame drops, SurfaceFlinger missed deadlines and HAL request latency while the VLM runs, and set an acceptable jank budget.
+
+## 3. Prefix caching for system prompts and repeated images
+
+### 3.1 What and why
+Causal attention means the KV of a token depends only on the tokens **before** it. If two requests share an identical prefix, the prefix's KV can be reused, so you skip its prefill.
+
+**System prompt:** a 500-token system prompt is about 14 MB of KV (at 28 KB per token) and about 100 to 200 ms of prefill. Precompute its KV **once** (even offline at install or first launch) and load it in milliseconds on every request.
+
+### 3.2 Layered caches
+1. **Encoder-output cache** (key = hash of image pixels + preprocessing config): skips the vision encoder (about 100 ms) when the same image appears again.
+2. **LLM KV prefix cache** (key = hash of the prefix tokens + image hash + model/adapter/KV-format version): for `[system prompt + image]`, so follow-up questions only prefill the new text tokens.
+
+### 3.3 Rules and pitfalls
+- **Order matters.** Put stable content first: system prompt, then image, then the variable user question. Anything that changes early (timestamps, user names in the system prompt) invalidates everything after it.
+- **The image KV depends on the whole prefix and on positions.** With a fixed-length system prompt, M-RoPE and 1D positions line up, so the cached image KV is reusable (Q3).
+- **Cache key must include everything that affects the KV:** model hash, tokenizer, quantization and KV format, RoPE configuration, **LoRA adapter ID** (different weights mean different KV), and chat template version.
+- **Static-graph handling:** loading cached KV is a memcpy into the KV buffer plus setting the write index, then chunked prefill of the suffix at an offset. Align the prefix length to the chunk size (or design the system prompt length as a multiple of it) to avoid wasting a partial chunk.
+- **Capacity:** one cached 320-token image KV is about 9 MB. Use an LRU cache with a memory cap (e.g. 64 to 128 MB), and drop it under memory pressure (Q14).
+- **Persist the system-prompt KV on disk** (memory-mapped, quantized), keyed by version, so it survives restarts.
+- **Privacy and security:** caches contain user-derived data, so keep them in app-private storage, encrypt as required, and clear on logout. In a shared multi-app service, isolate caches per client, since prefix-cache hit timing can leak whether another client used a prompt.
+- **Multi-turn:** reuse the whole conversation prefix, and apply an eviction or summarization policy when the context grows (Q14).
+
+## 4. Putting it together: a scheduler loop (sketch)
+
+```
+each iteration:
+    budget = TOKENS_PER_ITER                     # bounds the stall seen by decoding streams
+    decode all active slots (1 token each, or k+1 with speculation if enabled for the task)
+    if pending prefill and camera_not_in_burst:
+        run one prefill chunk (size C) for the highest-priority request   # preemptible unit
+    adapt: read thermal / memory / camera-jank signals
+           → lower k, C, tiles, or slots; or defer background work
+```
+
+## 5. Strong interview answer
+> "Decode is memory-bandwidth-bound, so verifying k+1 tokens in one pass costs roughly the same as decoding one, because the weights are read once and we stay far below the compute ridge. That is why speculative decoding can help on a mobile NPU. The speedup is E over cost, where E = (1 − α^(k+1))/(1 − α) and the cost is k·c + v, with c the draft-to-target cost ratio. With α = 0.7, k = 4 and c = 0.1 that is about 1.9x, but with α = 0.5 and c = 0.3 it is slower than not speculating. The catch on-device is that the target is already 1 to 2B, so a 10x cheaper draft is about 100M parameters. That makes EAGLE-style heads on the target's hidden states, which reuse its LM head and visual information, or free prompt-lookup for copy-heavy OCR and JSON outputs, better fits than a separate draft model. Medusa heads are expensive with a 152k vocabulary. It hurts with low acceptance, for example after domain fine-tuning without re-tuning the draft, with a draft that is too costly, with no small-M verify graph or tree-mask support on the NPU, with per-iteration host sync overhead, and for short outputs. For batching, I'd use slot-based static batching on the NPU: a decode graph for S slots with per-slot positions and masks, since an extra stream is nearly free while memory-bound. I'd use chunked prefill with C near the ridge, interleaved with decode, and priorities and preemption. With the camera and ISP running, I'd treat them as hard real-time, split long graphs into sub-graphs so the NPU has yield points, schedule between frames, use latest-frame-wins queues, and measure frame drops in Perfetto. Prefix caching has two layers: an encoder-output cache keyed by image hash, and a KV prefix cache, with system prompt first, then the image, then the question, keyed by model, adapter, KV format and RoPE configuration. The system-prompt KV can be precomputed offline and mmapped, which saves 100 to 200 ms of TTFT per request, and loading it is a memcpy plus an offset into chunked prefill. I'd keep caches app-private for privacy."
+
+## 6. Follow-up questions to prepare for
+1. Derive the expected accepted tokens per iteration and the speedup. When is the speedup below 1?
+2. Why does verifying k+1 tokens cost about the same as 1 on a memory-bound decoder, and when does that stop being true?
+3. Why are Medusa heads costly with a large vocabulary, and how does EAGLE avoid that?
+4. What does a verify graph need on a static-graph NPU, and how do you roll back rejected tokens?
+5. Why must the system prompt come before the image for prefix caching to work?
+6. What must the prefix-cache key include, and what happens if you forget the LoRA adapter ID?
+7. How would you give a camera pipeline priority over a long VLM encoder graph on an NPU that can't preempt?
+8. How would you size the chunk for chunked prefill on a given NPU?

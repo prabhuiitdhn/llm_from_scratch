@@ -965,3 +965,291 @@ Mitigation to keep concatenation's text ability: LoRA adapters that are applied 
 5. How would you implement lazy prefill for an always-on camera in a concatenation design, and what is the latency trade-off?
 6. What would you need to add to an on-device runtime to support cross-attention layers (cache types, masks, graph partitioning)?
 7. Why can a shared frozen LLM be an advantage for memory on a phone?
+
+---
+
+# Q6: Multi-stage VLM training recipe
+
+**Question:** Describe a production recipe (projector alignment → full or LoRA instruction tuning → optional preference tuning). Which components do you freeze or unfreeze at each stage, and why? What failure modes appear if the vision encoder is unfrozen too early (catastrophic drift, loss of OCR or fine-grained capability)?
+
+Hyperparameters below are typical starting points from the LLaVA, Qwen2-VL and related papers (recalled from memory). Treat them as defaults to tune, not fixed rules.
+
+## 0. The big picture
+
+```
+Pretrained ViT (contrastive/hybrid)     Pretrained LLM (text-only)        Random-init projector
+          └───────────────┬────────────────────┘                                 │
+                          ▼                                                      │
+Stage 1  Projector alignment      train: projector            freeze: ViT, LLM ◄─┘
+Stage 1.5 (optional) mid-training train: all (or ViT+proj+LLM) high-quality knowledge/OCR/doc data
+Stage 2  Visual instruction SFT   train: projector + LLM (full or LoRA); ViT frozen or low-LR
+Stage 3  Preference tuning (opt.) train: LLM (LoRA or small LR); ViT frozen; DPO-style
+Stage 4  Compression-aware (opt.) QAT / distillation for the on-device target (see Q10, Q11)
+```
+
+**Why stages at all?** A VLM glues together two independently pretrained models through a randomly initialized projector. Each stage is there to avoid destroying what the pretrained parts already know while the new glue is still bad.
+
+## 1. Stage-by-stage recipe
+
+| Stage | Trainable | Frozen | Data | Typical LR | Purpose |
+|---|---|---|---|---|---|
+| **1. Alignment** | Projector only | ViT, LLM | ~0.5M to several M image-caption pairs (clean, short) | ~1e-3 (MLP projector), 1 epoch | Map visual features into the LLM's embedding space |
+| **1.5 Mid-training** (optional) | All, or ViT + projector + LLM | Nothing, or ViT partly | Millions of higher-quality samples: detailed captions, OCR, documents, charts, knowledge | ~2e-5 LLM, ViT 10x lower | Inject visual knowledge, OCR and fine-grained skills |
+| **2. Visual instruction SFT** | Projector + LLM (full or LoRA); ViT frozen or low-LR | ViT (or most of it) | ~0.5M to several M instruction samples: VQA, OCR, docs, charts, grounding, reasoning, multi-turn, plus text-only data | ~2e-5 (full), ViT ~2e-6 if unfrozen, cosine, 1 to 3 epochs | Teach instruction following, formats, reasoning over images |
+| **3. Preference tuning** (optional) | LLM via LoRA or very small LR | ViT, projector (usually) | Image-grounded preference pairs (hallucination-focused) | ~5e-7 to 5e-6 (full), β ≈ 0.1 | Reduce hallucination, improve style and safety |
+| **4. Compression-aware** (optional) | Depends (QAT, distillation) | — | Mix of earlier data | Low | Preserve accuracy after quantization |
+
+Real-world examples:
+- **LLaVA-1.5:** stage 1 trains the projector on about 558K caption pairs, stage 2 trains projector + LLM on about 665K instruction samples. The vision encoder stays frozen.
+- **LLaVA-NeXT / OneVision:** adds a high-quality "knowledge" stage and unfreezes the ViT at a learning rate about 10x lower than the LLM's.
+- **Qwen2-VL (as reported):** stage 1 trains only the ViT on image-text data, stage 2 unfreezes everything on a large mixed multimodal corpus, stage 3 freezes the ViT and instruction-tunes the LLM.
+
+## 2. Why each choice
+
+### Stage 1: why freeze both backbones and train only the projector
+- The projector starts random. Its outputs are garbage at first, so the loss is high and gradients are large and noisy.
+- If those gradients flow into the pretrained LLM or ViT, they overwrite good weights to compensate for a bad projector. The backbones **co-adapt to a broken connector** instead of the connector learning to speak their language.
+- Training only the projector is cheap (a few million parameters), stable and fast. A high learning rate is safe.
+- The data is simple captions. The result is mostly alignment, little instruction following.
+
+**Nuance:** some studies (e.g. Prismatic VLMs) reported that a separate stage 1 barely helps and a single-stage run saves compute. So treat the two-stage split as a safe default, not a law, and validate it on your setup.
+
+### Stage 2: why unfreeze the LLM
+- The LLM must learn to follow instructions about images, produce the right formats (short answers, JSON, boxes), and reason over visual tokens.
+- **Full fine-tuning vs LoRA:**
+  - Full FT has more capacity and is the better choice with millions of samples. For a 0.5 to 2B LLM, it is affordable.
+  - LoRA is lighter on memory, protects text ability (the base weights stay put), and suits small data or limited compute.
+- Keep **text-only data** (about 10 to 20% of the mix) in the blend to protect language ability.
+- Mask the loss: compute it only on assistant tokens, not on the prompt or visual-token positions.
+
+### Whether to unfreeze the ViT in stage 2
+The evidence is mixed:
+- Some studies found a **frozen** encoder is better or equal (Prismatic, with their data).
+- Others (Cambrian-1, LLaVA-NeXT) found unfreezing at a **lower LR** improves results, especially for OCR and fine-grained tasks, once there is enough data.
+- The practical rule: freeze early, unfreeze late, at about 10x lower LR than the LLM, with enough data, and with monitoring (see section 3).
+
+### Stage 3: why preference tuning
+SFT'd VLMs lean on language priors and hallucinate objects and attributes. Preference data teaches "grounded beats plausible".
+- **Data:**
+  - RLHF-V (human fine-grained corrections).
+  - RLAIF-V (AI feedback from open models).
+  - POVID (create rejected answers by injecting errors).
+  - mDPO (adds an image-conditional preference: a corrupted image makes the original answer "rejected", forcing the model to actually use the image).
+  - MPO / mixed preference optimization.
+- **Settings:** LoRA or a very small LR on the LLM, ViT frozen, β around 0.1. Add an SFT term to avoid likelihood displacement, where the chosen answers' likelihood drops too.
+- **Watch for:** verbosity and length bias, image-agnostic preferences, general-capability regression.
+- **Optional extension:** RL with verifiable rewards (GRPO) for grounding (IoU reward), counting or math. Note that this tends to lengthen outputs, which raises on-device latency.
+
+## 3. Failure modes of unfreezing the vision encoder too early
+
+**What "too early" means:** unfreezing the ViT in stage 1, before the projector is aligned, or at the full LLM learning rate, or on small or narrow data.
+
+1. **Garbage-gradient drift.** A random projector produces large noisy gradients that flow back through the LLM into the ViT. The ViT features distort to compensate for the bad projector, and the representation learned from billions of pairs is overwritten by a few hundred thousand samples.
+2. **Loss of OCR and fine-grained detail ("capability collapse").**
+   - Early-stage data is typically low-resolution, short captions.
+   - Captions rarely mention small text, small objects or exact counts. The encoder is rewarded only for the gist, so it **discards** the fine detail.
+   - OCR, charts and small objects then degrade, often without any obvious loss-curve warning. The training loss looks fine while the capability is gone.
+3. **Catastrophic forgetting of semantics and robustness.** Zero-shot recognition, rare concepts, multilingual text and out-of-distribution robustness degrade.
+4. **Instability.** Loss spikes, growing activation norms or attention entropy collapse, especially with bf16 and high LR.
+5. **Position-embedding drift** if you also change the resolution while training.
+6. **Cost.** Backpropagating through a high-resolution ViT multiplies activation memory and time, so you need gradient checkpointing.
+
+**How to detect it:**
+- **Feature drift:** compare unfrozen ViT features against the frozen reference on a probe set (cosine similarity or CKA) per layer.
+- **Probes:** linear or attentive probes on OCR crops and dense tasks, and zero-shot accuracy if the contrastive head is kept.
+- **Per-stage eval gates:** run TextVQA, DocVQA, OCRBench and your product tasks after each stage.
+- **Per-module gradient norms** to spot an exploding connector.
+
+**How to mitigate it:**
+- Always run stage 1 (projector warm-up) first.
+- Unfreeze with a **ViT learning rate about 10x lower** than the LLM's.
+- Use **layer-wise LR decay** (lowest LR for early ViT layers), or unfreeze **only the last N blocks**, or use LoRA on the ViT.
+- Add a **feature-distillation or L2-SP loss** toward the original encoder, or use EMA.
+- Keep **OCR and dense data** in the mix, and train at the target resolution.
+
+## 4. Other failure modes across the stages
+
+| Stage | Failure | Cause and fix |
+|---|---|---|
+| 1 | Under-trained projector, so hallucination later | Too few steps or poor data. Check alignment quality on held-out captions |
+| 2 | Text ability regression | LLM drift. Add text data, use LoRA, lower LR, or interpolate weights with the base model (WiSE-FT style) |
+| 2 | Overfitting | Too many epochs. Use 1 to 3 epochs and check validation loss |
+| 2 | Wrong or missing label masks, wrong chat template, missing image tokens | Pipeline bugs that look like "model quality" problems. Unit-test the data collator |
+| 2 | Data imbalance | One domain dominates. Use balanced or weighted sampling |
+| 2 | Packing cross-contamination | Attention leaking across packed samples. Use proper masks |
+| 2 | Benchmark contamination | Dedup against eval sets |
+| 3 | Likelihood displacement, verbosity | Add an SFT term, length control, tune β |
+| 3 | Image-agnostic preferences | Use image-conditional pairs such as mDPO |
+
+## 5. Production considerations for a small on-device VLM
+- **Train at the deployed configuration.** The projector is tied to the encoder, the LLM, the pixel-shuffle ratio and the tile/token budget. Fix these before stage 1, and don't change the token budget after alignment without retraining the projector.
+- **Resolution curriculum.** Align at low resolution (cheap), then move to the target resolution and tiling in later stages.
+- **Don't redo stage 1 unnecessarily.** For domain adaptation (appliance UIs, home-robot scenes), start from an already aligned and instruction-tuned small VLM and run a stage-2-style domain SFT with LoRA. Redo stage 1 only if you swap the encoder or the LLM, or change the projector (this connects to Q7).
+- **Gate each stage with evals,** including a text-only regression check, an OCR/dense-task check and a hallucination check (POPE/CHAIR). Version the data and seeds for reproducibility.
+- **Plan for quantization early.** Run PTQ evaluation after each stage, and use QAT in the last stage if INT4/INT8 hurts the vision tower or projector (Q11).
+- **Compute:** stage 1 fits on one GPU. Stage 2 usually needs FSDP or ZeRO, bf16, gradient checkpointing and packing. As a reference point, the LLaVA-1.5 paper reports roughly a day on 8×A100 for the 13B model.
+
+## 6. Strong interview answer
+> "A VLM glues a pretrained ViT and a pretrained LLM through a random projector, so I stage training to protect both backbones. Stage 1 freezes the ViT and LLM and trains only the projector on clean captions at a high LR, so bad early gradients don't overwrite pretrained knowledge. An optional mid-training stage unfreezes more on high-quality OCR, document and knowledge data. Stage 2 is visual instruction tuning: projector plus LLM, full fine-tuning when I have millions of samples, LoRA when data or compute is small, with text-only data mixed in to protect language ability, and the loss masked to assistant tokens. I keep the ViT frozen, or unfreeze it at about 10x lower LR once I have enough data. Stage 3, optional, is DPO-style preference tuning on image-grounded pairs, with the ViT frozen, to cut hallucination. Unfreezing the ViT too early is dangerous: a random projector sends noisy gradients that drift the features away from their pretrained state, and narrow low-res caption data teaches the encoder to drop detail that captions never mention, so OCR and fine-grained capability collapse, often without a visible loss warning. I'd detect that with feature-drift measurements, probes and per-stage eval gates, and prevent it with projector warm-up, low or layer-wise ViT LR, partial unfreezing, and distillation toward the original encoder. For an on-device product I'd fix the token budget and resolution before alignment and start domain work from an already aligned model rather than redoing stage 1."
+
+## 7. Follow-up questions to prepare for
+1. Why does a random projector send harmful gradients to the backbones, and why does a high LR on the projector alone not hurt?
+2. How does narrow caption data cause the encoder to lose OCR ability, and why doesn't the training loss show it?
+3. Full FT vs LoRA in stage 2: how do you decide for a 1.5B LLM and 200k samples?
+4. How would you measure and prevent text-ability regression in stage 2?
+5. Why is image-conditional preference data (mDPO) needed for DPO on VLMs?
+6. When would you skip stage 1, and what does that cost?
+7. How do you pick the order of the resolution curriculum, and what changes when you move to tiling?
+
+---
+
+# Q7: Fine-tuning a VLM with limited data and compute
+
+**Question:** You have 20k domain-specific image-text pairs, such as appliance UI screens or home-robot scenes. Compare LoRA, QLoRA, DoRA, prefix tuning and projector-only tuning. How do you choose the target modules and ranks, and how do you stop the model forgetting general capabilities? How do you detect and measure forgetting?
+
+Hyperparameters are common starting points (recalled from the LoRA, QLoRA and DoRA papers and practice). Tune them on your own validation data.
+
+## 0. Frame the problem before choosing a method
+
+**20k pairs is small, and the base model matters.** The right starting point is an already aligned and instruction-tuned small VLM (SmolVLM, Qwen2-VL-2B and similar), not a raw encoder + LLM. You are doing domain adaptation, not stage 1 or 2 from Q6.
+
+**First, find out what you are teaching.** The adaptation needed decides the method:
+
+| What fails | Where the fix lives | Cheapest method |
+|---|---|---|
+| Output format, style, domain vocabulary (e.g. strict JSON for UI states) | LLM | LoRA on the LLM, small rank |
+| New reasoning over domain concepts | LLM | LoRA, medium rank |
+| The encoder can't "see" the domain (tiny icons, UI widgets, rare appliance parts) | Vision encoder, projector, resolution | ViT LoRA or partial unfreeze, projector, higher resolution or tiles |
+| Visual style shift only (screenshots vs photos) | Projector | Projector-only |
+
+**Diagnostic: oracle-caption test.** Give the LLM a correct text description of the image instead of the image. If it then answers correctly, the failures are **perception**. If it still fails, they are **language, reasoning or format**. This tells you where to spend your trainable parameters.
+
+**Data shape gotcha.** "Image-text pairs" are often captions. Training only on bare captions teaches the model to caption everything and erodes instruction-following. Wrap the data in diverse instruction templates (caption, VQA, structured extraction) and mix in general instruction data.
+
+## 1. The methods compared
+
+### Full fine-tuning
+Highest capacity, but it needs optimizer state for every parameter, overfits easily with 20k samples, and forgets the most. Not the first choice here.
+
+### LoRA
+Freeze W and learn a low-rank update: `W' = W + (α/r)·B·A`, with `A` (r × d_in), `B` (d_out × r). `B` is initialized to zero, so training starts from the base model.
+- Trainable parameters per matrix: `r · (d_in + d_out)`.
+- **Mergeable:** after training you fold `BA` into `W`, so there is **no inference overhead**. This matters on-device.
+- A study ("LoRA Learns Less and Forgets Less") reported that LoRA underperforms full fine-tuning on the target domain for hard tasks, but forgets less and keeps more diverse outputs. That is the trade-off you want with 20k samples.
+
+### QLoRA
+LoRA on top of a **4-bit (NF4) quantized base**, with double quantization and paged optimizers. The adapters are trained in BF16.
+- Cuts training memory a lot, which matters for 7B and larger models on a single GPU.
+- **For a 2B VLM it's rarely needed.** 2B in BF16 is about 4 GB, so plain LoRA fits comfortably on a 16 to 24 GB GPU.
+- Costs: slower steps (dequantization), a small quality gap, and **merging into a quantized base isn't lossless**. For deployment you merge into the BF16 base and re-quantize, so evaluate after that step.
+- Quantize only the LLM. The vision encoder and projector are more quantization-sensitive (Q11).
+
+### DoRA
+Decomposes each weight into **magnitude and direction**. LoRA updates only the direction, and a separate magnitude vector is learned.
+- Reported to behave closer to full fine-tuning, and to be more robust at low rank.
+- Mergeable, so there is no inference overhead. Training is slightly slower and uses more memory.
+- Gains are usually modest. Try it when LoRA at a reasonable rank underfits.
+
+### Other LoRA knobs worth knowing
+rsLoRA (scales by α/√r for stability at high ranks), LoRA+ (different learning rates for A and B), PiSSA (initializes from principal singular components), VeRA (tiny, shared random matrices), AdaLoRA (adaptive rank allocation).
+
+### Prefix tuning / prompt tuning
+Train **virtual tokens**: soft prompt embeddings at the input, or key/value prefixes at each layer.
+- Very few trainable parameters and no weight changes.
+- Drawbacks: the virtual tokens **consume context and KV positions at inference** and can't be merged into weights. They are less expressive and more sensitive to initialization and learning rate, and weaker on small models (prompt tuning improves with scale).
+- Rarely preferred over LoRA for a 1 to 2B model.
+
+### Projector-only tuning
+Train the few million projector parameters and freeze everything else.
+- Very cheap, no text-ability forgetting, and a strong **first baseline**.
+- Fixes alignment shifts: a different visual style, a changed token budget or resolution.
+- Cannot teach new output formats, vocabulary or reasoning, and cannot fix encoder blind spots.
+
+### Comparison
+
+| Method | Trainable % | Training memory | Forgetting risk | Domain capacity | Inference overhead | Best when |
+|---|---|---|---|---|---|---|
+| Full FT | 100% | Highest | Highest | Highest | None | Lots of data, big budget |
+| **LoRA** | ~1 to 2% | Low | Low to medium | Medium to high | None after merge | **Default** |
+| QLoRA | ~1 to 2% | Lowest | Low to medium | Medium | None after merge (re-quantize) | ≥7B models on small GPUs |
+| DoRA | ~1 to 2% | Low+ | Low to medium | Medium to high | None after merge | LoRA underfits at low rank |
+| Prefix / prompt | <0.1% | Very low | Very low | Low | Extra tokens/KV | Rare for small models |
+| Projector-only | ~0.2 to 1% | Very low | Very low (text-wise) | Low (alignment only) | None | Baseline, style shift, token-budget change |
+
+## 2. Choosing target modules and ranks
+
+### Target modules
+- **LLM: apply LoRA to all linear layers** (q, k, v, o and the MLP gate, up and down projections). The QLoRA paper found that LoRA on all linear layers matters more than the rank, and that attention-only LoRA does not match full fine-tuning. The MLP layers store much of the "knowledge", so they matter for domain facts. For format-only or style-only tasks, attention-only is often enough.
+- **Projector: train it fully.** It is small. Add it to the modules that are saved and trained (`modules_to_save` in common libraries).
+- **Vision encoder:** add LoRA to the ViT attention and MLP layers (often just the last third of the layers) **only if the oracle-caption test shows perception errors**. Use a lower learning rate.
+- **Embeddings and LM head:** leave them alone, unless you add new special tokens (for example box-coordinate or UI-action tokens). Then train those new rows via `modules_to_save`.
+- **Norm layers:** leave frozen.
+
+### Rank, alpha and learning rate
+- **Start with r = 16** on all linear layers, α = 16 to 32 (scale α/r of 1 to 2). Sweep {8, 16, 32, 64}.
+- Rank tracks **task complexity**, not data size. Format and style tasks need r of roughly 4 to 16. New perception or knowledge needs r of 32 to 64 or more. Beyond that you see diminishing returns, and higher rank means more learning and more forgetting.
+- **Worked example (Qwen2.5-1.5B-sized LLM, 28 layers, d = 1536, MLP 8960, GQA with kv_dim 256), r = 16, all linear:**
+  - Per layer: q ≈ 49k, k ≈ 29k, v ≈ 29k, o ≈ 49k, gate ≈ 168k, up ≈ 168k, down ≈ 168k → about 659k.
+  - Across 28 layers → about 18.5M trainable parameters, around **1.2% of 1.5B**.
+- **Learning rate:** LoRA uses a higher LR than full fine-tuning, typically 1e-4 to 2e-4 for adapters, cosine schedule, 3 to 5% warmup, dropout about 0.05. If you also train the projector, use about 1e-5 to 1e-4. For ViT LoRA, use about 1e-5 to 5e-5.
+- **Epochs:** 2 to 3 for 20k samples, with early stopping on validation. Effective batch size 32 to 64.
+
+### Compute budget (illustrative)
+- 20k samples × roughly 600 tokens (image + text) ≈ 12M tokens per epoch. On a single A100-class GPU with a ~2B model this is on the order of tens of minutes to a couple of hours per epoch.
+- Memory is dominated by **activations from image tokens**, not weights. Use gradient checkpointing, cap the number of tiles or `max_pixels` during training, small micro-batches with gradient accumulation, bf16, FlashAttention and an 8-bit or paged optimizer if needed.
+
+## 3. Preventing forgetting
+
+1. **Limit what can change.** Low rank, fewer modules, frozen encoder. This is the cheapest protection.
+2. **Replay / data mixing.** Mix about 10 to 30% general data: general VQA, OCR, instruction data and **text-only** data.
+   - If you don't have the original SFT data, use **self-generated replay**: sample the base model's answers on general images and prompts, and train on them. This works as self-distillation.
+3. **Lower LR and fewer epochs.** Stop at the knee of the domain-vs-general curve.
+4. **Regularize toward the base model.** Add a KL or logit-distillation loss on replay data. L2-SP and EWC exist but are rarely used in practice.
+5. **Weight-space interpolation (free knob).** After training, scale the adapter by λ < 1 when merging (or interpolate base and fine-tuned weights, as in WiSE-FT). Sweep λ ∈ {0.3 … 1.0} and pick the point on the domain-vs-general Pareto curve.
+6. **Separate adapters.** Keep a domain adapter apart from the base and load it only for domain requests. It costs only tens of MB. On static-graph NPUs it is usually merged instead, since runtime support for hot-swapping adapters is limited.
+7. **Keep prompt and chat-template formats consistent,** and vary the system prompts you train with.
+
+## 4. Detecting and measuring forgetting
+
+**Build two evaluation sets before you train:**
+1. **Domain set:** held-out samples plus a small human-curated golden set.
+2. **General regression suite:** fixed subsets of MMBench, MMMU, TextVQA, DocVQA, ChartQA, OCRBench, POPE, MME, plus **text-only** checks (an MMLU subset, IFEval, GSM8K), safety/refusal behavior, and multilingual checks (e.g. Hindi).
+
+**What to measure:**
+- **Forgetting = acc_base − acc_finetuned** per benchmark. Report the average drop and the worst-case drop. Set product-driven gates, for example "general average drop ≤ 1 to 2 points and no single benchmark drops more than 3 to 5 points".
+- **Track at checkpoints** (every N steps) and choose the checkpoint at the knee.
+- **Cheap continuous proxy:** the KL divergence or perplexity relative to the base model's outputs on general prompts.
+- **Behavior drift:** output length and style, language switching, hallucination rate (POPE), refusal behavior, calibration.
+- **If the ViT was tuned:** feature drift versus the frozen encoder (CKA or cosine similarity) on a probe set.
+
+**Statistical care:** small eval sets are noisy. Use several hundred samples per slice, bootstrap confidence intervals, greedy decoding, and multiple seeds for the key decisions.
+
+## 5. The data side (where 20k pairs usually go wrong)
+- **UI screenshots and robot scenes are extremely repetitive,** so the effective number of samples is far below 20k. Deduplicate near-duplicates (perceptual hashes, embeddings).
+- **Split by app, device, scene or session, not randomly.** A random split leaks near-identical screens into validation and gives inflated scores.
+- **Augment:** image augmentations (crop, color, brightness, resolution jitter), question paraphrases, and several task formulations from the same image (caption, VQA, grounding, state classification). Add verified synthetic Q&A from a larger teacher, plus hard negatives.
+- **Label quality over quantity.** Audit a few hundred samples and enforce one consistent output schema (for example JSON).
+- Watch class imbalance and the long tail.
+
+## 6. Recommended recipe (decision flow)
+1. **Baseline:** zero-shot and few-shot with the base VLM. Run error analysis with the oracle-caption test.
+2. **Run 1:** projector + LLM LoRA (r = 16, all linear), LR 2e-4, 2 to 3 epochs, 20 to 30% replay. Evaluate on the domain set and the general suite.
+3. **If perception-bound:** add ViT LoRA (last third, low LR), or raise the resolution or tile budget (then re-check the token budget on-device).
+4. **If it underfits:** try r = 32 or 64, or DoRA. **If it overfits or forgets:** drop to r = 8, add replay, cut epochs, or use adapter scaling λ < 1.
+5. **Pareto sweep** of the merge scale λ. Pick the best trade-off and gate it with the general suite.
+6. **Deploy:** merge the LoRA into the BF16 base, then quantize (INT4 weights), and **re-run both domain and general evals after quantization**.
+
+**Production gotcha: quantization can erase LoRA gains.** A LoRA delta has a small magnitude and can be of the same order as INT4 rounding noise, so part of the fine-tuning benefit disappears after quantization. Mitigations: train against the quantized base (QLoRA-style, or QA-LoRA / LoftQ initialization), use QAT in a final stage, or keep the adapter separate in higher precision (costs extra latency and needs runtime support).
+
+## 7. Strong interview answer
+> "With 20k domain pairs I'd start from an already aligned and instruction-tuned small VLM, and first find what actually fails. The oracle-caption test separates perception errors from language and format errors. Then I'd pick the cheapest method that covers that failure. Projector-only is the baseline: no text forgetting, but it can only fix alignment shifts. LoRA on all linear layers of the LLM plus a fully trained projector is my default, since it merges with no inference overhead, and at 'learns less, forgets less' it suits small data. QLoRA is for 7B and larger, because a 2B model fits in BF16, and it makes merging and deployment quantization more awkward. DoRA is a drop-in for when low-rank LoRA underfits. Prefix tuning adds tokens at inference and is weaker on small models. I'd use r around 16 on all linear layers with LR around 2e-4, sweep 8 to 64, and add ViT LoRA only if the errors are perceptual. To limit forgetting I'd mix 10 to 30% general and text-only replay, keep a KL term to the base model, stop early, and sweep an adapter scale at merge time to pick the Pareto point. I'd measure forgetting with a fixed regression suite covering general VQA, OCR, text-only, safety and multilingual behavior, gating on average and worst-case drop with confidence intervals. The data pitfalls are near-duplicate screens and leaked splits, so I'd deduplicate and split by app or scene. Finally, I'd re-evaluate after merging and quantizing, because INT4 can wipe out small LoRA deltas."
+
+## 8. Follow-up questions to prepare for
+1. Why is LoRA on all linear layers better than higher rank on attention only?
+2. Why does LoRA "learn less and forget less", and when is that the wrong trade-off?
+3. Why can INT4 quantization erase LoRA gains, and what are your options?
+4. How does DoRA's magnitude/direction decomposition change training dynamics?
+5. How would you build replay data when you don't have the original SFT set?
+6. How would you tell a perception failure from a reasoning failure in a failing VQA sample?
+7. Why does a random split of UI screenshots overestimate accuracy, and how do you fix the split?
+8. When would you hot-swap LoRA adapters on-device, and what does the NPU runtime need?
